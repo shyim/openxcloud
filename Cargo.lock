@@ -6795,7 +6795,7 @@ dependencies = [
 
 [[package]]
 name = "xcloud-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6815,7 +6815,7 @@ dependencies = [
 
 [[package]]
 name = "xcloud-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -6848,7 +6848,7 @@ dependencies = [
 
 [[package]]
 name = "xcloud-gpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "block2 0.6.2",
  "eframe",
@@ -6868,7 +6868,7 @@ dependencies = [
 
 [[package]]
 name = "xcloud-input"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "gilrs",
  "objc2 0.6.5",
@@ -6882,7 +6882,7 @@ dependencies = [
 
 [[package]]
 name = "xcloud-media"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cpal",
  "crossbeam-channel",
@@ -6902,7 +6902,7 @@ dependencies = [
 
 [[package]]
 name = "xcloud-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "serde",
@@ -6914,7 +6914,7 @@ dependencies = [
 
 [[package]]
 name = "xcloud-stream"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -6933,7 +6933,7 @@ dependencies = [
 
 [[package]]
 name = "xcloud-webrtc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",

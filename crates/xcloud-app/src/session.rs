@@ -549,6 +549,20 @@ mod tests {
         harness_with_store(Arc::new(MemoryTokenStore::new()))
     }
 
+    /// Wait for the OS command-forwarding thread, which does not follow tokio's paused
+    /// clock. The snapshot may already be unauthenticated before a restore is processed.
+    async fn wait_for_tokens_restored(h: &Harness, expected: &StreamTokens) {
+        let events = h.events.clone();
+        let event =
+            tokio::task::spawn_blocking(move || events.recv_timeout(Duration::from_secs(5)))
+                .await
+                .unwrap();
+        assert_eq!(
+            event,
+            Ok(SessionEvent::TokensRestored(Box::new(expected.clone())))
+        );
+    }
+
     /// `RestoreSession` always reports the stored bundle first (`bootstrap` →
     /// `updateApiCredentials`).
     fn expect_tokens_restored(h: &Harness, expected: &StreamTokens) {
@@ -963,10 +977,9 @@ mod tests {
         let request_count = h.transport.request_count();
         // Restoring now finds nothing.
         h.session.send(SessionCommand::RestoreSession);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_tokens_restored(&h, &StreamTokens::default()).await;
         assert_eq!(h.session.read().state, AuthState::Unauthenticated);
         assert_eq!(h.transport.request_count(), request_count);
-        expect_tokens_restored(&h, &StreamTokens::default());
         assert!(h.events.try_recv().is_err());
     }
 
@@ -993,8 +1006,7 @@ mod tests {
         };
         h.store.save_stream_tokens(&replaced).unwrap();
         h.session.send(SessionCommand::RestoreSession);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        expect_tokens_restored(&h, &stored_tokens());
+        wait_for_tokens_restored(&h, &stored_tokens()).await;
         assert!(h.events.try_recv().is_err());
     }
 

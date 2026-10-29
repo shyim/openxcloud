@@ -8,6 +8,7 @@
 //! Typography uses the system UI font at real weights: on macOS the variable
 //! `SFNS.ttf` is registered four times with different `wght` coordinates
 //! ([`Weight`]); elsewhere every weight falls back to egui's bundled font.
+//! Bundled DejaVu Sans supplies arrows and Hebrew/Arabic glyphs on every platform.
 //!
 //! The constant names of the QML port (`BACKGROUND`, `SURFACE`, `ACCENT`, …) are
 //! kept so the stream view and HUD pick up the new palette unchanged.
@@ -297,8 +298,8 @@ const SYMBOL_FALLBACK_FONTS: &[(&str, &str)] = &[
 const SYMBOL_FALLBACK_FONTS: &[(&str, &str)] = &[];
 
 /// Builds the font set: the system UI font at every [`Weight`] in front of egui's
-/// bundled fonts, then the symbol fallbacks. Returns the definitions and whether the
-/// system font was found.
+/// fonts, bundled DejaVu Sans, then platform symbol fallbacks. Returns the definitions
+/// and whether the system font was found.
 pub fn font_definitions() -> (FontDefinitions, bool) {
     let mut defs = FontDefinitions::default();
     let bundled: Vec<String> = defs
@@ -325,6 +326,19 @@ pub fn font_definitions() -> (FontDefinitions, bool) {
         }
         family.extend(bundled.iter().cloned());
         defs.families.insert(weight.family(), family);
+    }
+
+    // Named weight families need the same portable glyph coverage as proportional.
+    // Keep this after the primary fonts so their typography remains unchanged.
+    let fallback = "DejaVu Sans";
+    defs.font_data.insert(
+        fallback.to_owned(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../../../assets/fonts/DejaVuSans.ttf"
+        ))),
+    );
+    for family in defs.families.values_mut() {
+        family.push(fallback.to_owned());
     }
 
     for (name, path) in SYMBOL_FALLBACK_FONTS {
@@ -434,6 +448,40 @@ mod tests {
             let family = defs.families.get(&weight.family());
             assert!(family.is_some_and(|f| !f.is_empty()), "{weight:?}");
         }
+    }
+
+    #[test]
+    fn bundled_fonts_cover_hud_and_rtl_locale_glyphs_in_every_family() {
+        let (mut defs, _) = font_definitions();
+        // Simulate a host without platform fonts, even when running on macOS.
+        let defaults = FontDefinitions::default();
+        defs.font_data
+            .retain(|name, _| defaults.font_data.contains_key(name) || name == "DejaVu Sans");
+        for family in defs.families.values_mut() {
+            family.retain(|name| defs.font_data.contains_key(name));
+        }
+        let ctx = egui::Context::default();
+        ctx.set_font_providers(vec![]);
+        ctx.set_fonts(defs);
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.fonts_mut(|fonts| {
+                let families = Weight::ALL
+                    .map(Weight::family)
+                    .into_iter()
+                    .chain([FontFamily::Monospace]);
+                for family in families {
+                    let font = FontId::new(15.0, family);
+                    let rtl_names = xcloud_proto::locales::LOCALES
+                        .iter()
+                        .filter(|locale| matches!(locale.code, "he-IL" | "ar-SA"))
+                        .flat_map(|locale| locale.native.chars());
+                    for ch in "1440p → 2160p FSR".chars().chain(rtl_names) {
+                        assert!(fonts.has_glyph(&font, ch), "{font:?} lacks {ch:?}");
+                    }
+                }
+            });
+        });
+        output.textures_delta.clear();
     }
 
     #[test]
