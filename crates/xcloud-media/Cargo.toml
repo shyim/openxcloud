@@ -1,0 +1,35 @@
+[package]
+name = "xcloud-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Frame types, VideoDecoder trait, Annex-B helpers, the VideoToolbox H.264 backend, the Opus decoder and PCM playback (cpal + rtrb)"
+
+[features]
+default = []
+ffmpeg = ["dep:ffmpeg-next"]
+
+[dependencies]
+ffmpeg-next = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+h264-reader = { workspace = true }
+triple_buffer = { workspace = true }
+opus = { workspace = true }
+cpal = { workspace = true }
+rtrb = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { workspace = true }
+objc2-core-video = { workspace = true }
+objc2-core-media = { workspace = true }
+objc2-video-toolbox = { workspace = true }
+
+[[example]]
+name = "decode_file"
+path = "examples/decode_file.rs"

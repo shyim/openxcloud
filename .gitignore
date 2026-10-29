@@ -1,0 +1,16 @@
+/target/
+/dist/
+**/*.rs.bk
+.DS_Store
+/fixtures/*.rtp
+*.log
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.mobileprovision
+/settings.json
+/user_data.json
+
+/fixtures/testsrc_1080p60.h264

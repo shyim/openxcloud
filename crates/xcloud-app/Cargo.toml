@@ -1,0 +1,73 @@
+[package]
+name = "xcloud-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+rust-version.workspace = true
+description = "OpenXCloud: Xbox Cloud Gaming desktop client (egui/eframe)"
+
+[lib]
+name = "xcloud_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openxcloud"
+path = "src/main.rs"
+
+[features]
+default = ["ffmpeg"]
+# Portable FFmpeg H.264 backend (non-macOS default, or OPENXCLOUD_SOFTWARE_VIDEO=ffmpeg on macOS).
+ffmpeg = ["xcloud-media/ffmpeg"]
+# MetalFX spatial upscaling as a selectable alternative to FSR 1.0 (macOS; the setting
+# falls back to FSR without it). Passthrough to xcloud-gpu.
+metalfx = ["xcloud-gpu/metalfx"]
+
+[dependencies]
+xcloud-proto = { workspace = true }
+xcloud-api = { workspace = true }
+xcloud-webrtc = { workspace = true }
+xcloud-stream = { workspace = true }
+xcloud-media = { workspace = true }
+xcloud-gpu = { workspace = true }
+xcloud-input = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+wgpu = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+open = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+directories = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# System language for the default locale (CFLocaleCopyCurrent).
+objc2-core-foundation = { workspace = true, features = ["CFLocale", "CFString"] }
+
+[dev-dependencies]
+egui_kittest = { workspace = true, features = ["wgpu"] }
+# `tokio::time::pause()` / `start_paused` need the test-util feature; it is only
+# enabled for this crate's own test builds (session.rs tests).
+tokio = { workspace = true, features = ["test-util"] }
+
+# `cargo bundle --release -p xcloud-app` (https://github.com/burtonageo/cargo-bundle)
+[package.metadata.bundle]
+name = "OpenXCloud"
+identifier = "de.shyim.openxcloud"
+category = "public.app-category.games"
+short_description = "Xbox Cloud Gaming client"
+long_description = "OpenXCloud streams your Game Pass library with a native WebRTC transport, hardware video decode and GPU upscaling."
+
+[package.metadata.bundle.osx]
+minimum_system_version = "13.0"

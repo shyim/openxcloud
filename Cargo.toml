@@ -1,0 +1,99 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/xcloud-api",
+    "crates/xcloud-app",
+    "crates/xcloud-gpu",
+    "crates/xcloud-input",
+    "crates/xcloud-media",
+    "crates/xcloud-proto",
+    "crates/xcloud-stream",
+    "crates/xcloud-webrtc",
+]
+default-members = ["crates/xcloud-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.99"
+repository = "https://github.com/shyim/openxcloud"
+
+[workspace.dependencies]
+# internal
+xcloud-proto = { path = "crates/xcloud-proto" }
+xcloud-api = { path = "crates/xcloud-api" }
+webrtc = "0.21.1"
+rtc = { version = "0.21", default-features = false }
+xcloud-webrtc = { path = "crates/xcloud-webrtc" }
+xcloud-media = { path = "crates/xcloud-media" }
+xcloud-stream = { path = "crates/xcloud-stream" }
+xcloud-gpu = { path = "crates/xcloud-gpu" }
+xcloud-input = { path = "crates/xcloud-input" }
+
+# core
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+triple_buffer = "9"
+rtrb = "0.4"
+
+# async / net
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip"] }
+async-trait = "0.1"
+
+# storage
+keyring = "4"
+directories = "6"
+
+# ui / gpu  (egui 0.37 pins wgpu 30 and winit 0.30)
+egui = "0.37"
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "system_fonts", "x11", "wayland", "accesskit", "links"] }
+egui-wgpu = "0.37"
+egui_kittest = "0.37"
+wgpu = "30"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+open = "5"
+
+# media
+h264-reader = "0.9"
+ffmpeg-next = "9"
+opus = "0.4"
+cpal = "0.18"
+
+# macOS frameworks
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-video = "0.3"
+objc2-core-media = "0.3"
+objc2-video-toolbox = "0.3"
+objc2-metal = "0.3"
+objc2-metal-fx = "0.3"
+objc2-game-controller = "0.3"
+
+# input
+gilrs = "0.11"
+
+# Desktop launch arguments
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 4
+
+[profile.dev.package."*"]
+opt-level = 2

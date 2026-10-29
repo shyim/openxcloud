@@ -1,0 +1,25 @@
+[package]
+name = "xcloud-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Controller (gilrs) and keyboard virtual-controller sampling into the xCloud InputQueue"
+
+[dependencies]
+xcloud-proto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+gilrs = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Claims the controller Home button from the system while streaming
+# (GCControllerElement.preferredSystemGestureState).
+objc2 = { workspace = true }
+objc2-game-controller = { workspace = true }
+objc2-foundation = { workspace = true }

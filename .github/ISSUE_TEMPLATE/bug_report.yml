@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible OpenXCloud problem.
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach tokens, authorization headers, account data, or raw session captures. Review logs before sharing them.
+  - type: input
+    id: version
+    attributes:
+      label: App version or commit
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS version, CPU architecture, and GPU
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce, expected result, and actual result
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Relevant sanitized logs or screenshots

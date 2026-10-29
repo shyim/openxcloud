@@ -1,0 +1,44 @@
+[package]
+name = "xcloud-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+rust-version.workspace = true
+description = "wgpu video path: zero-copy frame import, WGSL NV12 to RGB, FSR 1.0 upscale, egui texture glue"
+
+[dependencies]
+xcloud-media = { workspace = true }
+wgpu = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+# MetalFX spatial upscaling (`MTLFXSpatialScaler`) as a runtime alternative to the FSR 1.0
+# passes. macOS only; a no-op elsewhere.
+metalfx = [
+    "dep:objc2-metal-fx",
+    "dep:block2",
+    "objc2-metal/block2",
+    "objc2-metal/objc2-core-foundation",
+]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-core-foundation = { workspace = true }
+objc2-core-video = { workspace = true }
+objc2-metal = { workspace = true }
+objc2-metal-fx = { workspace = true, optional = true }
+block2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+eframe = { workspace = true }
+triple_buffer = { workspace = true }
+
+[[example]]
+name = "replay"
+path = "examples/replay.rs"

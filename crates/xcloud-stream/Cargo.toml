@@ -1,0 +1,28 @@
+[package]
+name = "xcloud-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+rust-version.workspace = true
+
+[dependencies]
+xcloud-proto = { workspace = true }
+xcloud-api = { workspace = true }
+xcloud-webrtc = { workspace = true }
+xcloud-media = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+triple_buffer = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# `tokio::time::pause()` / `start_paused` need the test-util feature; it is only
+# enabled for this crate's own test builds.
+tokio = { workspace = true, features = ["test-util"] }

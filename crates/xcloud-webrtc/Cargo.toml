@@ -1,0 +1,21 @@
+[package]
+name = "xcloud-webrtc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+rust-version.workspace = true
+description = "WebRTC transport abstraction and portable webrtc-rs implementation"
+
+[dependencies]
+xcloud-proto = { workspace = true }
+webrtc = { workspace = true }
+rtc = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
