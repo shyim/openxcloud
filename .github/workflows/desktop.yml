@@ -1,7 +1,9 @@
 name: Desktop checks and packages
 on:
   push:
+    branches: ["**"]
   pull_request:
+  workflow_call:
   workflow_dispatch:
 permissions:
   contents: read

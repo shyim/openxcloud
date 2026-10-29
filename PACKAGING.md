@@ -57,7 +57,32 @@ desktop session are required for playback.
   and manual dispatch. The synthetic H.264 test fixture is generated with FFmpeg.
 - `transport.yml`: protocol and WebRTC tests on macOS, Linux, and Windows.
 
-No workflow publishes a release or uses signing credentials. Windows desktop
+- `release.yml`: pushing a version tag such as `v0.1.0` runs both reusable check
+  workflows, then uploads the macOS Apple Silicon ZIP, Ubuntu 24.04 amd64 `.deb`,
+  and `SHA256SUMS` to a GitHub Release. Only the publish job has write permission.
+
+### Publish a release
+
+Set `workspace.package.version` in `Cargo.toml`, update `Cargo.lock`, and commit
+and push the release changes (including the release workflow). Tag that commit:
+
+```sh
+git tag -a v0.1.0 -m "OpenXCloud 0.1.0"
+git push origin v0.1.0
+```
+
+The tag must match the Cargo version exactly. Tags containing a prerelease suffix
+(such as `v0.2.0-beta.1`) create prereleases. Branch pushes and pull requests only
+produce CI artifacts. No additional token or signing secret is required: the
+publish job uses GitHub's built-in `GITHUB_TOKEN`.
+
+Both platforms and transport tests must succeed before a draft release is created.
+The draft becomes public only after all three assets upload. If uploading fails,
+rerun the failed jobs to finish the draft. Published release assets are never
+replaced by a rerun; use a new version tag for corrections. Downloaded packages
+can be checked with `sha256sum -c SHA256SUMS` (macOS: `shasum -a 256 -c SHA256SUMS`).
+
+Publishing does not add Developer ID signing or notarization. Windows desktop
 packaging is pending native build and playback validation; its transport CI is not
 a desktop compatibility guarantee.
 

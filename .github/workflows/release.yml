@@ -1,0 +1,81 @@
+name: Publish release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          tag = os.environ['RELEASE_TAG']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', tag):
+              raise SystemExit(f'Expected a version tag such as v0.1.0; got {tag}')
+          if tag != f'v{version}':
+              raise SystemExit(f'Tag {tag} does not match Cargo version {version}')
+          PY
+  desktop:
+    needs: version
+    uses: ./.github/workflows/desktop.yml
+  transport:
+    needs: version
+    uses: ./.github/workflows/transport.yml
+  publish:
+    needs: [desktop, transport]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages from this run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: OpenXCloud-*
+          merge-multiple: true
+          path: dist
+      - name: Verify packages and create checksums
+        working-directory: dist
+        run: |
+          test -s OpenXCloud-macos-arm64.zip
+          test -s OpenXCloud-linux-amd64.deb
+          sha256sum OpenXCloud-macos-arm64.zip OpenXCloud-linux-amd64.deb > SHA256SUMS
+      - name: Upload assets and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          # A failed upload leaves a draft that a rerun can finish. Published
+          # releases are never overwritten by a rerun.
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
+            if [ "$draft" != true ]; then
+              echo 'Release is already published; refusing to replace its assets.' >&2
+              exit 1
+            fi
+          else
+            prerelease=(--prerelease=false)
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              prerelease=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes \
+              --title "OpenXCloud $RELEASE_TAG" "${prerelease[@]}" \
+              --notes 'macOS: Apple Silicon app, ad-hoc signed and not notarized. Linux: amd64 Debian package built on Ubuntu 24.04. See PACKAGING.md at this tag for platform requirements.'
+          fi
+          gh release upload "$RELEASE_TAG" \
+            dist/OpenXCloud-macos-arm64.zip dist/OpenXCloud-linux-amd64.deb dist/SHA256SUMS --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
