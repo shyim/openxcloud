@@ -65,6 +65,7 @@ tokio = { workspace = true, features = ["test-util"] }
 [package.metadata.bundle]
 name = "OpenXCloud"
 identifier = "de.shyim.openxcloud"
+icon = ["assets/icons/openxcloud-[0-9]*.png"]
 category = "public.app-category.games"
 short_description = "Xbox Cloud Gaming client"
 long_description = "OpenXCloud streams your Game Pass library with a native WebRTC transport, hardware video decode and GPU upscaling."

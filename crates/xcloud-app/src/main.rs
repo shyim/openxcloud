@@ -196,6 +196,12 @@ fn native_options(present_mode: wgpu::PresentMode) -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!(
+                    "../../../assets/icons/openxcloud-256.png"
+                ))
+                .expect("embedded app icon is a valid PNG"),
+            )
             .with_app_id(APP_ID)
             .with_inner_size(DEFAULT_WINDOW_SIZE)
             .with_min_inner_size(MIN_WINDOW_SIZE),
