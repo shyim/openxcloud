@@ -10,9 +10,9 @@ use egui::{
 };
 
 use crate::settings::{
-    LABEL_DEADZONE, LABEL_FRAME_RATE, LABEL_INVERT_Y, LABEL_IPV6, LABEL_PRESENT, LABEL_REGION,
-    LABEL_RESOLUTION, LABEL_SHARPNESS, LABEL_SWAP_AB, LABEL_TRIGGER, LABEL_UPSCALE,
-    LABEL_UPSCALER_KIND, LABEL_VIBRATION,
+    LABEL_DEADZONE, LABEL_FRAME_RATE, LABEL_HARDWARE_DECODE, LABEL_INVERT_Y, LABEL_IPV6,
+    LABEL_PRESENT, LABEL_REGION, LABEL_RESOLUTION, LABEL_SHARPNESS, LABEL_SWAP_AB, LABEL_TRIGGER,
+    LABEL_UPSCALE, LABEL_UPSCALER_KIND, LABEL_VIBRATION,
 };
 use crate::state::AppSettings;
 use crate::theme::{self, Weight, font_w};
@@ -474,6 +474,15 @@ fn video(ui: &mut Ui, s: &mut AppSettings) -> bool {
             s.present_mode = value.to_owned();
             changed = true;
         }
+    }
+    if cfg!(target_os = "linux") {
+        heading(ui, "Decoding", "");
+        changed |= kit::setting_row(
+            ui,
+            LABEL_HARDWARE_DECODE,
+            "Decode the stream on the GPU with VAAPI. Applies after restarting OpenXCloud",
+            |ui| kit::toggle(ui, &mut s.hardware_decode, LABEL_HARDWARE_DECODE).changed(),
+        );
     }
     heading(ui, "Overlay", "");
     changed |= kit::setting_row(

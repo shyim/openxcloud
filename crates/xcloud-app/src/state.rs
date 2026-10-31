@@ -354,6 +354,9 @@ pub struct AppSettings {
     /// or "metalfx" (macOS, `--features metalfx`; falls back to FSR when unavailable).
     /// `OPENXCLOUD_UPSCALER` overrides it (`xcloud_gpu::UPSCALER_ENV`).
     pub upscaler: String,
+    /// New in the Rust port: decode with VAAPI on Linux (opt-in, read at start-up).
+    /// `OPENXCLOUD_SOFTWARE_VIDEO` still forces software decoding.
+    pub hardware_decode: bool,
 }
 
 impl Default for AppSettings {
@@ -377,6 +380,7 @@ impl Default for AppSettings {
             upscale_height: 2160,
             sharpness: 0.25,
             upscaler: "fsr".into(),
+            hardware_decode: false,
         }
     }
 }

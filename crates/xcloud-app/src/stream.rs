@@ -79,8 +79,13 @@ const PUBLISH_INTERVAL_MS: u64 = 1000;
 pub type DecoderFactory = Box<dyn FnOnce(FrameSink) -> Box<dyn VideoDecoder> + Send>;
 
 /// The platform decoder: VideoToolbox on macOS (`OPENXCLOUD_SOFTWARE_VIDEO` honoured), the
-/// FFmpeg elsewhere when enabled (otherwise a counting null decoder).
-pub fn default_decoder_factory() -> DecoderFactory {
+/// FFmpeg elsewhere when enabled (otherwise a counting null decoder). `hardware_decode`
+/// (`AppSettings::hardware_decode`) selects the FFmpeg VAAPI hwaccel on Linux.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "ffmpeg")),
+    allow(unused_variables)
+)]
+pub fn default_decoder_factory(hardware_decode: bool) -> DecoderFactory {
     // `OPENXCLOUD_SOFTWARE_VIDEO=ffmpeg` selects the portable backend when it is compiled in.
     #[cfg(feature = "ffmpeg")]
     if ffmpeg_requested() {
@@ -110,6 +115,16 @@ pub fn default_decoder_factory() -> DecoderFactory {
     #[cfg(all(target_os = "macos", not(feature = "ffmpeg")))]
     {
         Box::new(|sink| Box::new(xcloud_media::vt::VtDecoder::with_defaults(sink)))
+    }
+    #[cfg(all(target_os = "linux", feature = "ffmpeg"))]
+    if hardware_decode && std::env::var_os(xcloud_media::ffmpeg::SOFTWARE_VIDEO_ENV).is_none() {
+        return Box::new(|sink| {
+            let config = xcloud_media::ffmpeg::FfmpegConfig {
+                hwaccel: xcloud_media::ffmpeg::Hwaccel::Vaapi,
+                ..xcloud_media::ffmpeg::FfmpegConfig::default()
+            };
+            Box::new(xcloud_media::ffmpeg::FfmpegDecoder::new(config, sink))
+        });
     }
     #[cfg(all(not(target_os = "macos"), feature = "ffmpeg"))]
     {

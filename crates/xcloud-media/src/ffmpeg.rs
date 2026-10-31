@@ -7,7 +7,8 @@
 //! [`FfmpegDecoder::reset`], and on macOS a VideoToolbox `hw_device_ctx` unless
 //! `OPENXCLOUD_SOFTWARE_VIDEO` is set (the pipeline's `H264Decoder m_videoDecoder{true}` plus the
 //! constructor's `qEnvironmentVariableIsSet("OPENXCLOUD_SOFTWARE_VIDEO")` check; the variable's
-//! value is irrelevant, only its presence counts). Off macOS the decoder is always software.
+//! value is irrelevant, only its presence counts). Off macOS the decoder is software unless
+//! [`Hwaccel::Vaapi`] is requested explicitly (Linux, opt-in).
 //!
 //! Differences, all on the output side (docs/archive/PORTING_PLAN.md section 5.3): frames are delivered
 //! as [`NativeBuffer::Nv12Cpu`] instead of an RGB `QImage` (yuv420p planes are interleaved
@@ -47,6 +48,10 @@ pub enum Hwaccel {
     /// `AV_HWDEVICE_TYPE_VIDEOTOOLBOX` through `av_hwdevice_ctx_create`; falls back to
     /// software when the device cannot be created, like the C++ constructor.
     VideoToolbox,
+    /// `AV_HWDEVICE_TYPE_VAAPI` on the default DRM render node (Linux, opt-in). Decoded
+    /// surfaces are downloaded to CPU NV12 with `av_hwframe_transfer_data`; falls back to
+    /// software when the device cannot be created.
+    Vaapi,
 }
 
 impl Default for Hwaccel {
@@ -529,36 +534,91 @@ unsafe fn attach_hwaccel(ctx: *mut ffi::AVCodecContext, hwaccel: Hwaccel) -> boo
                 tracing::warn!(target: LOG, "Hwaccel::VideoToolbox is macOS-only; decoding in software");
                 return false;
             }
-            let mut device: *mut ffi::AVBufferRef = ptr::null_mut();
-            // SAFETY: valid out-pointer; a non-zero return leaves `device` null.
-            let status = unsafe {
-                ffi::av_hwdevice_ctx_create(
-                    &mut device,
+            // SAFETY: forwarded from the caller.
+            unsafe {
+                attach_device(
+                    ctx,
                     ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
-                    ptr::null(),
-                    ptr::null_mut(),
-                    0,
+                    "VIDEOTOOLBOX",
+                    pick_videotoolbox_format,
                 )
-            };
-            if status != 0 || device.is_null() {
-                tracing::warn!(target: LOG, status, "av_hwdevice_ctx_create(VIDEOTOOLBOX) failed; decoding in software");
+            }
+        }
+        Hwaccel::Vaapi => {
+            if !cfg!(target_os = "linux") {
+                tracing::warn!(target: LOG, "Hwaccel::Vaapi is Linux-only; decoding in software");
                 return false;
             }
-            // SAFETY: the codec context takes ownership of `device` and frees it in
-            // `avcodec_free_context`.
+            // SAFETY: forwarded from the caller.
             unsafe {
-                (*ctx).hw_device_ctx = device;
-                (*ctx).get_format = Some(pick_videotoolbox_format);
+                attach_device(
+                    ctx,
+                    ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                    "VAAPI",
+                    pick_vaapi_format,
+                )
             }
-            true
         }
     }
+}
+
+/// `av_hwdevice_ctx_create(kind)` on the default device and the matching `get_format`
+/// callback. Returns whether a device context is attached.
+///
+/// # Safety
+/// `ctx` must be a valid, not yet opened codec context.
+unsafe fn attach_device(
+    ctx: *mut ffi::AVCodecContext,
+    kind: ffi::AVHWDeviceType,
+    name: &str,
+    get_format: unsafe extern "C" fn(
+        *mut ffi::AVCodecContext,
+        *const ffi::AVPixelFormat,
+    ) -> ffi::AVPixelFormat,
+) -> bool {
+    let mut device: *mut ffi::AVBufferRef = ptr::null_mut();
+    // SAFETY: valid out-pointer; a non-zero return leaves `device` null.
+    let status =
+        unsafe { ffi::av_hwdevice_ctx_create(&mut device, kind, ptr::null(), ptr::null_mut(), 0) };
+    if status != 0 || device.is_null() {
+        tracing::warn!(target: LOG, status, "av_hwdevice_ctx_create({name}) failed; decoding in software");
+        return false;
+    }
+    // SAFETY: the codec context takes ownership of `device` and frees it in
+    // `avcodec_free_context`.
+    unsafe {
+        (*ctx).hw_device_ctx = device;
+        (*ctx).get_format = Some(get_format);
+    }
+    true
 }
 
 /// The C++ `get_format` lambda: prefer `AV_PIX_FMT_VIDEOTOOLBOX`, else the first offer.
 unsafe extern "C" fn pick_videotoolbox_format(
     _ctx: *mut ffi::AVCodecContext,
     formats: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    // SAFETY: FFmpeg passes its AV_PIX_FMT_NONE-terminated offer list.
+    unsafe { pick_format(formats, ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX) }
+}
+
+/// Prefer `AV_PIX_FMT_VAAPI`, else the first (software) offer, e.g. for a profile the
+/// driver cannot decode.
+unsafe extern "C" fn pick_vaapi_format(
+    _ctx: *mut ffi::AVCodecContext,
+    formats: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    // SAFETY: FFmpeg passes its AV_PIX_FMT_NONE-terminated offer list.
+    unsafe { pick_format(formats, ffi::AVPixelFormat::AV_PIX_FMT_VAAPI) }
+}
+
+/// `wanted` when FFmpeg offers it, else the first offer.
+///
+/// # Safety
+/// `formats` must be null or an `AV_PIX_FMT_NONE`-terminated list.
+unsafe fn pick_format(
+    formats: *const ffi::AVPixelFormat,
+    wanted: ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
     if formats.is_null() {
         return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
@@ -567,7 +627,7 @@ unsafe extern "C" fn pick_videotoolbox_format(
     // SAFETY: FFmpeg terminates the list with AV_PIX_FMT_NONE.
     unsafe {
         while *p != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-            if *p == ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
+            if *p == wanted {
                 return *p;
             }
             p = p.add(1);
@@ -630,10 +690,11 @@ fn convert_frame(
         matches!(format, Pixel::YUVJ420P | Pixel::YUVJ422P | Pixel::YUVJ444P),
     );
 
-    if format == Pixel::VIDEOTOOLBOX {
+    if matches!(format, Pixel::VIDEOTOOLBOX | Pixel::VAAPI) {
         #[cfg(target_os = "macos")]
         {
-            if codec.native_frames
+            if format == Pixel::VIDEOTOOLBOX
+                && codec.native_frames
                 && let Some(buf) = native_pixel_buffer(&codec.frame)
             {
                 return Ok(Some(Frame {
@@ -647,7 +708,8 @@ fn convert_frame(
                 }));
             }
         }
-        // The CPU fallback (`nativeVideoEnabled == false`): download the hardware frame.
+        // The CPU fallback (`nativeVideoEnabled == false`) and every VAAPI frame: download
+        // the hardware frame.
         let mut software = ffmpeg::frame::Video::empty();
         // SAFETY: `software` is an empty frame FFmpeg fills; `frame` is a valid hw frame.
         let status = unsafe {
@@ -1177,6 +1239,38 @@ mod tests {
                     assert_nv12_1080p(frame);
                 }
             }
+        }
+    }
+
+    /// The VAAPI path on Linux on the 1080p fixture: frames come back as CPU NV12 after
+    /// `av_hwframe_transfer_data`. Skips when the machine has no usable VAAPI device.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vaapi_hwaccel_downloads_nv12() {
+        let aus = split_access_units(FIXTURE);
+        let (sink, frames) = collecting_sink();
+        let config = FfmpegConfig {
+            hwaccel: Hwaccel::Vaapi,
+            native_frames: true,
+            complete_frames: true,
+        };
+        let mut decoder = FfmpegDecoder::new(config, sink);
+        assert!(decoder.is_valid(), "{:?}", decoder.last_error());
+        if !decoder.hwaccel_active() {
+            eprintln!("skipping: no VAAPI device");
+            return;
+        }
+        let results = decode_aus(&mut decoder, &aus[..30]);
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        decoder.flush();
+        let frames = frames.lock().unwrap();
+        assert!(
+            frames.len() >= 28,
+            "{} frames (hardware decoders may hold a few back)",
+            frames.len()
+        );
+        for frame in frames.iter() {
+            assert_nv12_1080p(frame);
         }
     }
 

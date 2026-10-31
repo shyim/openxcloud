@@ -205,7 +205,7 @@ impl App {
                 api: Some(Arc::clone(&services.api)),
                 settings: Arc::clone(&settings),
                 repaint,
-                decoder: default_decoder_factory(),
+                decoder: default_decoder_factory(settings.read().hardware_decode),
                 audio: AudioOutput::new(),
                 gamepad: native_gamepad_factory(),
             },
