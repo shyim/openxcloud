@@ -738,6 +738,11 @@ impl Shared {
     fn start_attempt(self: &Arc<Self>) {
         let mut state = self.state.lock();
         if state.cancelled {
+            tracing::debug!(
+                target: LOG,
+                "stream attempt {} skipped: connect was cancelled",
+                state.attempt + 1
+            );
             return;
         }
         state.attempt += 1;
@@ -1158,6 +1163,10 @@ impl SignalingOrchestrator {
                 );
                 return;
             }
+            // A new connect supersedes the cancellation left by the previous
+            // `disconnect`/`cancel_pending_connect`; otherwise every stream after the
+            // first one in a process would stop silently in `start_attempt`.
+            state.cancelled = false;
             state.kind = kind;
             state.target_id = target_id.to_owned();
             state.user_token = msa_user_token.to_owned();
@@ -1795,6 +1804,25 @@ mod tests {
 
     fn int_field(value: &Value, key: &str) -> i64 {
         value.get(key).and_then(Value::as_i64).unwrap_or_default()
+    }
+
+    /// A connect after a user disconnect must start a new attempt instead of being
+    /// swallowed by the previous stream's cancellation.
+    #[tokio::test]
+    async fn connect_after_disconnect_starts_a_new_attempt() {
+        let fake = Arc::new(FakeTransport::new());
+        let orchestrator = orchestrator(&fake);
+        orchestrator.connect_stream(StreamKind::Cloud, "first", "");
+        assert_eq!(orchestrator.lifecycle(), StreamLifecycleState::Failed);
+
+        orchestrator.cancel_pending_connect();
+        orchestrator.disconnect(DisconnectIntent::UserInitiated);
+        assert_eq!(orchestrator.lifecycle(), StreamLifecycleState::Disconnected);
+
+        // Without an API the attempt fails right away, which proves it ran.
+        orchestrator.connect_stream(StreamKind::Cloud, "second", "");
+        assert_eq!(orchestrator.lifecycle(), StreamLifecycleState::Failed);
+        assert_eq!(orchestrator.last_error().code, StreamErrorCode::Unsupported);
     }
 
     /// `inputWaitsForHandshake` for one data row.
