@@ -11,8 +11,8 @@ use egui::{
 
 use crate::settings::{
     LABEL_DEADZONE, LABEL_FRAME_RATE, LABEL_HARDWARE_DECODE, LABEL_INVERT_Y, LABEL_IPV6,
-    LABEL_PRESENT, LABEL_REGION, LABEL_RESOLUTION, LABEL_SHARPNESS, LABEL_SWAP_AB, LABEL_TRIGGER,
-    LABEL_UPSCALE, LABEL_UPSCALER_KIND, LABEL_VIBRATION,
+    LABEL_LICENSED_ONLY, LABEL_PRESENT, LABEL_REGION, LABEL_RESOLUTION, LABEL_SHARPNESS,
+    LABEL_SWAP_AB, LABEL_TRIGGER, LABEL_UPSCALE, LABEL_UPSCALER_KIND, LABEL_VIBRATION,
 };
 use crate::state::AppSettings;
 use crate::theme::{self, Weight, font_w};
@@ -291,7 +291,7 @@ impl SettingsSheet {
                         Category::Language => {
                             out.changed |= language(ui, settings, &mut self.language_filter)
                         }
-                        Category::Account => account(ui, out),
+                        Category::Account => out.changed |= account(ui, settings, out),
                         Category::About => about(ui, app_version),
                     }
                     ui.add_space(24.0);
@@ -717,11 +717,17 @@ fn locale_row(
     response
 }
 
-fn account(ui: &mut Ui, out: &mut SheetOutput) {
+fn account(ui: &mut Ui, s: &mut AppSettings, out: &mut SheetOutput) -> bool {
     heading(
         ui,
         "Your library",
         "Reload the Game Pass catalog and your recently played games.",
+    );
+    let changed = kit::setting_row(
+        ui,
+        LABEL_LICENSED_ONLY,
+        "Hide games that neither your subscription nor your purchases let you play",
+        |ui| kit::toggle(ui, &mut s.licensed_only, LABEL_LICENSED_ONLY).changed(),
     );
     if Button::new(LABEL_REFRESH)
         .icon(Icon::Refresh)
@@ -743,6 +749,7 @@ fn account(ui: &mut Ui, out: &mut SheetOutput) {
     {
         out.sign_out = true;
     }
+    changed
 }
 
 fn about(ui: &mut Ui, version: &str) {
