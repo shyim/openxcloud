@@ -71,6 +71,7 @@ pub const LABEL_PRESENT: &str = "Present mode";
 pub const LABEL_UPSCALE: &str = "Upscaler";
 pub const LABEL_UPSCALER_KIND: &str = "Upscaling method";
 pub const LABEL_SHARPNESS: &str = "Sharpness";
+pub const LABEL_HARDWARE_DECODE: &str = "Hardware decoding";
 
 // ----------------------------------------------------------------------------- paths
 
@@ -152,6 +153,8 @@ struct RenderGroup {
     sharpness: Option<f32>,
     /// `render/upscaler` (new): one of [`UPSCALERS`].
     upscaler: Option<String>,
+    /// `render/hardwareDecode` (new).
+    hardware_decode: Option<bool>,
 }
 
 impl SettingsFile {
@@ -180,6 +183,7 @@ impl SettingsFile {
                 upscale_height: Some(normalize_upscale_height(s.upscale_height)),
                 sharpness: Some(s.sharpness),
                 upscaler: Some(s.upscaler.clone()),
+                hardware_decode: Some(s.hardware_decode),
             },
         }
     }
@@ -223,6 +227,7 @@ impl SettingsFile {
             ),
             sharpness: self.render.sharpness.unwrap_or(d.sharpness),
             upscaler: normalize_upscaler(self.render.upscaler.as_deref().unwrap_or(&d.upscaler)),
+            hardware_decode: self.render.hardware_decode.unwrap_or(d.hardware_decode),
         }
     }
 }
@@ -504,6 +509,7 @@ mod tests {
             upscale_height: 1440,
             sharpness: 1.5,
             upscaler: "metalfx".into(),
+            hardware_decode: true,
         };
         let parsed = from_json(&to_json(&settings)).expect("valid json");
         assert_eq!(parsed, settings);
