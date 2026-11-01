@@ -134,6 +134,61 @@ const KEY_STREAM_TOKENS: &str = "stream_tokens";
 const KEY_BUNDLE: &str = "credentials_v1";
 type Credentials = HashMap<String, String>;
 
+/// Prefix of a [`KEY_BUNDLE`] value that points at chunk items instead of holding the
+/// JSON itself: `chunks:<generation>:<count>`. JSON always starts with `{`, so the two
+/// never collide.
+const CHUNK_HEADER: &str = "chunks:";
+
+/// Largest value one OS credential item accepts, in UTF-16 code units. Windows
+/// Credential Manager caps the blob at 2560 bytes and `keyring` stores UTF-16, so a
+/// full token bundle has to be split there. Elsewhere one item holds the whole bundle,
+/// which keeps macOS to a single Keychain item (and a single unlock prompt).
+#[cfg(windows)]
+const MAX_ITEM_UNITS: usize = 1280;
+#[cfg(not(windows))]
+const MAX_ITEM_UNITS: usize = usize::MAX;
+
+fn chunk_key(generation: u8, index: usize) -> String {
+    format!("{KEY_BUNDLE}.{generation}.{index}")
+}
+
+/// Splits `value` on char boundaries into pieces of at most `max_units` UTF-16 units.
+fn split_utf16(value: &str, max_units: usize) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let (mut start, mut units) = (0, 0);
+    for (at, ch) in value.char_indices() {
+        if units + ch.len_utf16() > max_units {
+            pieces.push(&value[start..at]);
+            (start, units) = (at, 0);
+        }
+        units += ch.len_utf16();
+    }
+    pieces.push(&value[start..]);
+    pieces
+}
+
+/// Where the bundle currently lives: inline in [`KEY_BUNDLE`], or in `count` chunk
+/// items of `generation`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Layout {
+    generation: u8,
+    count: usize,
+}
+
+fn parse_header(raw: &str) -> Option<Layout> {
+    let (generation, count) = raw.strip_prefix(CHUNK_HEADER)?.split_once(':')?;
+    Some(Layout {
+        generation: generation.parse().ok().filter(|g| *g <= 1)?,
+        count: count.parse().ok().filter(|c| *c > 0)?,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Cached {
+    values: Credentials,
+    layout: Layout,
+}
+
 trait CredentialBackend: Send + Sync {
     fn read(&self, key: &str) -> Result<String>;
     fn write(&self, key: &str, value: &str) -> Result<()>;
@@ -174,13 +229,15 @@ impl CredentialBackend for OsCredentials {
     }
 }
 
-/// One Keychain item for all credentials, loaded once per store and shared by clones.
-/// An absent bundle is a fresh, signed-out session.
+/// One Keychain item for all credentials (split into chunk items where the platform
+/// caps item size), loaded once per store and shared by clones. An absent bundle is a
+/// fresh, signed-out session.
 #[derive(Clone)]
 pub struct KeyringTokenStore {
     service: String,
     backend: Arc<dyn CredentialBackend>,
-    cache: Arc<Mutex<Option<Credentials>>>,
+    max_item_units: usize,
+    cache: Arc<Mutex<Option<Cached>>>,
 }
 
 impl std::fmt::Debug for KeyringTokenStore {
@@ -208,6 +265,7 @@ impl KeyringTokenStore {
             backend: Arc::new(OsCredentials {
                 service: service.to_owned(),
             }),
+            max_item_units: MAX_ITEM_UNITS,
             cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -216,28 +274,84 @@ impl KeyringTokenStore {
         &self.service
     }
 
-    fn load(&self) -> Result<Credentials> {
+    fn load(&self) -> Result<Cached> {
         let raw = self.backend.read(KEY_BUNDLE)?;
         if raw.is_empty() {
-            return Ok(Credentials::new());
+            return Ok(Cached {
+                values: Credentials::new(),
+                layout: Layout::default(),
+            });
         }
-        serde_json::from_str(&raw)
-            .map_err(|_| Error::TokenStore("invalid credential bundle".into()))
+        let (json, layout) = match parse_header(&raw) {
+            Some(layout) => {
+                let mut json = String::new();
+                for index in 0..layout.count {
+                    let piece = self.backend.read(&chunk_key(layout.generation, index))?;
+                    if piece.is_empty() {
+                        return Err(Error::TokenStore("incomplete credential bundle".into()));
+                    }
+                    json.push_str(&piece);
+                }
+                (json, layout)
+            }
+            None => (raw, Layout::default()),
+        };
+        let values = serde_json::from_str(&json)
+            .map_err(|_| Error::TokenStore("invalid credential bundle".into()))?;
+        Ok(Cached { values, layout })
     }
 
-    fn persist(&self, values: &Credentials) -> Result<()> {
-        self.backend
-            .write(KEY_BUNDLE, &serde_json::to_string(values)?)
+    /// Writes `values` and returns the layout they now occupy. Chunks go to the
+    /// generation `old` does not use and the header is written last, so a failure
+    /// part-way leaves the previous bundle readable.
+    fn persist(&self, values: &Credentials, old: Layout) -> Result<Layout> {
+        let json = serde_json::to_string(values)?;
+        let pieces = split_utf16(&json, self.max_item_units);
+        let layout = if pieces.len() == 1 {
+            self.backend.write(KEY_BUNDLE, &json)?;
+            Layout {
+                generation: old.generation,
+                count: 0,
+            }
+        } else {
+            let generation = 1 - old.generation;
+            for (index, piece) in pieces.iter().enumerate() {
+                self.backend.write(&chunk_key(generation, index), piece)?;
+            }
+            self.backend.write(
+                KEY_BUNDLE,
+                &format!("{CHUNK_HEADER}{generation}:{}", pieces.len()),
+            )?;
+            Layout {
+                generation,
+                count: pieces.len(),
+            }
+        };
+        self.remove_chunks(old);
+        Ok(layout)
+    }
+
+    /// Best effort: a chunk is unreachable once no header names its generation.
+    fn remove_chunks(&self, layout: Layout) {
+        for index in 0..layout.count {
+            if let Err(e) = self.backend.remove(&chunk_key(layout.generation, index)) {
+                tracing::warn!(target: "Auth", "leaving stale credential chunk: {e}");
+            }
+        }
+    }
+
+    fn cached<'a>(&self, cache: &'a mut Option<Cached>) -> Result<&'a mut Cached> {
+        if cache.is_none() {
+            *cache = Some(self.load()?);
+        }
+        Ok(cache.as_mut().unwrap())
     }
 
     fn read(&self, key: &str) -> Result<String> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if cache.is_none() {
-            *cache = Some(self.load()?);
-        }
-        Ok(cache
-            .as_ref()
-            .unwrap()
+        Ok(self
+            .cached(&mut cache)?
+            .values
             .get(key)
             .cloned()
             .unwrap_or_default())
@@ -245,10 +359,8 @@ impl KeyringTokenStore {
 
     fn update(&self, changes: &[(&str, &str)]) -> Result<()> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if cache.is_none() {
-            *cache = Some(self.load()?);
-        }
-        let mut values = cache.as_ref().unwrap().clone();
+        let cached = self.cached(&mut cache)?;
+        let mut values = cached.values.clone();
         for (key, value) in changes {
             if value.is_empty() {
                 values.remove(*key);
@@ -256,9 +368,9 @@ impl KeyringTokenStore {
                 values.insert((*key).to_owned(), (*value).to_owned());
             }
         }
-        if cache.as_ref() != Some(&values) {
-            self.persist(&values)?;
-            *cache = Some(values);
+        if cached.values != values {
+            cached.layout = self.persist(&values, cached.layout)?;
+            cached.values = values;
         }
         Ok(())
     }
@@ -326,8 +438,16 @@ impl TokenStore for KeyringTokenStore {
 
     fn clear_all(&self) -> Result<()> {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let layout = match cache.as_ref() {
+            Some(cached) => cached.layout,
+            None => parse_header(&self.backend.read(KEY_BUNDLE)?).unwrap_or_default(),
+        };
         self.backend.remove(KEY_BUNDLE)?;
-        *cache = Some(Credentials::new());
+        *cache = Some(Cached {
+            values: Credentials::new(),
+            layout: Layout::default(),
+        });
+        self.remove_chunks(layout);
         Ok(())
     }
 }
@@ -372,11 +492,106 @@ mod tests {
     }
 
     fn fake_store(backend: &Arc<FakeCredentials>) -> KeyringTokenStore {
+        chunked_store(backend, usize::MAX)
+    }
+
+    fn chunked_store(backend: &Arc<FakeCredentials>, max_item_units: usize) -> KeyringTokenStore {
         KeyringTokenStore {
             service: "test".into(),
             backend: backend.clone(),
+            max_item_units,
             cache: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn stored_keys(backend: &FakeCredentials) -> Vec<String> {
+        let mut keys: Vec<_> = backend.values.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn split_utf16_respects_char_boundaries_and_limit() {
+        assert_eq!(split_utf16("", 4), [""]);
+        assert_eq!(split_utf16("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        // "é" is one unit, "😀" two: never split a surrogate pair.
+        assert_eq!(split_utf16("é😀😀a", 3), ["é😀", "😀a"]);
+        assert_eq!(split_utf16("abc", usize::MAX), ["abc"]);
+    }
+
+    #[test]
+    fn oversized_bundle_is_split_across_items_and_reassembled() {
+        let backend = Arc::new(FakeCredentials::default());
+        let store = chunked_store(&backend, 64);
+        store.save_refresh_token(&"R".repeat(300)).unwrap();
+        store.save_stream_tokens(&sample_tokens()).unwrap();
+        assert!(
+            backend
+                .values
+                .lock()
+                .unwrap()
+                .values()
+                .all(|v| v.encode_utf16().count() <= 64)
+        );
+        assert!(backend.values.lock().unwrap()[KEY_BUNDLE].starts_with(CHUNK_HEADER));
+
+        let restarted = chunked_store(&backend, 64);
+        assert_eq!(restarted.load_refresh_token().unwrap(), "R".repeat(300));
+        assert_eq!(restarted.load_stream_tokens().unwrap(), sample_tokens());
+
+        // Rewriting moves to the other generation and drops the old chunks.
+        let before = stored_keys(&backend);
+        restarted.save_msa_token("MSA").unwrap();
+        let after = stored_keys(&backend);
+        assert!(
+            before
+                .iter()
+                .filter(|k| *k != KEY_BUNDLE)
+                .all(|k| !after.contains(k))
+        );
+
+        // Shrinking back below the limit stores inline and leaves no chunks.
+        let roomy = chunked_store(&backend, usize::MAX);
+        roomy.save_refresh_token("R").unwrap();
+        assert_eq!(stored_keys(&backend), [KEY_BUNDLE]);
+        assert_eq!(chunked_store(&backend, 64).load_msa_token().unwrap(), "MSA");
+    }
+
+    #[test]
+    fn sign_out_removes_every_chunk() {
+        let backend = Arc::new(FakeCredentials::default());
+        chunked_store(&backend, 32)
+            .save_stream_tokens(&sample_tokens())
+            .unwrap();
+        assert!(stored_keys(&backend).len() > 2);
+        // A fresh process signs out without having loaded the bundle first.
+        chunked_store(&backend, 32).clear_all().unwrap();
+        assert!(backend.values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_chunked_write_keeps_previous_bundle_readable() {
+        use std::sync::atomic::Ordering;
+        let backend = Arc::new(FakeCredentials::default());
+        let store = chunked_store(&backend, 32);
+        store.save_stream_tokens(&sample_tokens()).unwrap();
+        backend.fail_write.store(true, Ordering::Relaxed);
+        assert!(store.save_refresh_token(&"R".repeat(100)).is_err());
+        let restarted = chunked_store(&backend, 32);
+        assert_eq!(restarted.load_stream_tokens().unwrap(), sample_tokens());
+        assert_eq!(restarted.load_refresh_token().unwrap(), "");
+    }
+
+    #[test]
+    fn missing_chunk_is_an_error_not_a_signed_out_session() {
+        let backend = Arc::new(FakeCredentials::default());
+        chunked_store(&backend, 32)
+            .save_stream_tokens(&sample_tokens())
+            .unwrap();
+        let header = backend.values.lock().unwrap()[KEY_BUNDLE].clone();
+        let layout = parse_header(&header).unwrap();
+        backend.remove(&chunk_key(layout.generation, 1)).unwrap();
+        assert!(chunked_store(&backend, 32).load_stream_tokens().is_err());
     }
 
     #[test]
@@ -655,6 +870,13 @@ mod tests {
         assert!(!store.lpt_token_is_fresh().unwrap());
         store.save_lpt_token("LPT", None).unwrap();
         assert!(!store.lpt_token_is_fresh().unwrap());
+
+        // Real tokens outgrow one Windows Credential Manager item (2560 bytes).
+        let large = "T".repeat(6000);
+        store.save_refresh_token(&large).unwrap();
+        let restarted = KeyringTokenStore::with_service(store.service());
+        assert_eq!(restarted.load_refresh_token().unwrap(), large);
+        assert_eq!(restarted.load_stream_tokens().unwrap(), sample_tokens());
 
         // Saving an empty value removes the entry.
         store.save_refresh_token("").unwrap();
