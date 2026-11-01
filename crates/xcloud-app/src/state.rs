@@ -196,6 +196,8 @@ pub enum LibraryCommand {
     SetBrowseShelf(String),
     /// Store language/market for catalog text (`de-DE`); reloads a loaded library.
     SetLocale(String),
+    /// Hide titles the account is not entitled to; reloads a loaded library.
+    SetLicensedOnly(bool),
 }
 
 pub type LibraryHandle = Handle<LibrarySnapshot, LibraryCommand>;
@@ -357,6 +359,9 @@ pub struct AppSettings {
     /// New in the Rust port: decode with VAAPI on Linux (opt-in, read at start-up).
     /// `OPENXCLOUD_SOFTWARE_VIDEO` still forces software decoding.
     pub hardware_decode: bool,
+    /// New in the Rust port: list only titles the account is entitled to (subscription
+    /// or purchase).
+    pub licensed_only: bool,
 }
 
 impl Default for AppSettings {
@@ -381,6 +386,7 @@ impl Default for AppSettings {
             sharpness: 0.25,
             upscaler: "fsr".into(),
             hardware_decode: false,
+            licensed_only: false,
         }
     }
 }

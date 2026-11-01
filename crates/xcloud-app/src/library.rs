@@ -27,7 +27,9 @@ use parking_lot::{Mutex, RwLock};
 use xcloud_api::catalog::{CatalogQuery, GamePassCatalogClient};
 use xcloud_api::client::XCloudApiClient;
 use xcloud_proto::library_filter::{LibraryFilter, compare_names};
-use xcloud_proto::models::{CatalogProduct, CloudLibraryItem, LibraryCard, XCloudTitlesResponse};
+use xcloud_proto::models::{
+    CatalogProduct, CloudLibraryItem, LibraryCard, XCloudTitleDTO, XCloudTitlesResponse,
+};
 
 use crate::state::{FeatureGroup, LibraryCommand, LibrarySnapshot, Repaint, Shelf};
 
@@ -208,6 +210,9 @@ struct Inner {
     /// `m_mruTitleIds`.
     mru_title_ids: HashSet<String>,
     mru_order: Vec<String>,
+    /// Drop titles the account has no entitlement for (`details.hasEntitlement`: neither
+    /// covered by its subscription nor owned) when the titles are adopted.
+    licensed_only: bool,
     browse_shelf: String,
     query: String,
     filter: LibraryFilter,
@@ -232,6 +237,11 @@ struct Inner {
     /// reloaded (refresh, language switch) so cards keep their names and art while
     /// the new catalog data loads, and if it fails.
     catalog_cache: HashMap<String, CatalogProduct>,
+}
+
+/// Whether a title shows up in the library under the `licensed_only` setting.
+fn is_listed(licensed_only: bool, dto: &XCloudTitleDTO) -> bool {
+    !licensed_only || dto.has_entitlement
 }
 
 impl Inner {
@@ -259,14 +269,19 @@ impl Inner {
                 }
             }
             for entry in &mru.results {
-                if !entry.product_id.is_empty() {
+                if !entry.product_id.is_empty() && is_listed(self.licensed_only, entry) {
                     product_ids.push(entry.product_id.clone());
                 }
             }
         }
         self.raw_items.clear();
         self.cards.clear();
-        for dto in &titles.results {
+        let licensed_only = self.licensed_only;
+        for dto in titles
+            .results
+            .iter()
+            .filter(|dto| is_listed(licensed_only, dto))
+        {
             let item =
                 CloudLibraryItem::from_title_dto(dto, self.mru_title_ids.contains(&dto.title_id));
             self.cards.insert(item.title_id.clone(), item.to_card());
@@ -612,6 +627,24 @@ impl LibraryController {
             LibraryCommand::SetFilter(filter) => self.set_filter(filter),
             LibraryCommand::SetBrowseShelf(id) => self.set_browse_shelf(&id),
             LibraryCommand::SetLocale(locale) => self.set_locale(&locale),
+            LibraryCommand::SetLicensedOnly(value) => self.set_licensed_only(value),
+        }
+    }
+
+    /// Shows only titles the account is entitled to (`true`) or the whole catalog. A
+    /// library that was already loaded is reloaded with the new selection.
+    pub fn set_licensed_only(&self, value: bool) {
+        let loaded = {
+            let mut inner = self.shared.inner.lock();
+            if inner.licensed_only == value {
+                return;
+            }
+            tracing::info!(target: LOG, "licensed titles only: {value}");
+            inner.licensed_only = value;
+            inner.did_load
+        };
+        if loaded {
+            self.refresh(true);
         }
     }
 
@@ -830,8 +863,11 @@ async fn load_library(
         // "Loading artwork" screen.
         tracing::info!(
             target: LOG,
-            "library: {} titles, {} product ids",
+            "library: {} titles ({} of {} entitled, licensed only: {}), {} product ids",
             inner.raw_items.len(),
+            titles.results.iter().filter(|dto| dto.has_entitlement).count(),
+            titles.results.len(),
+            inner.licensed_only,
             product_ids.len()
         );
         inner.rebuild_filtered(true);
@@ -1002,6 +1038,43 @@ mod tests {
             .map(|c| c.title_id.as_str())
             .collect();
         assert_eq!(ids, ["C", "A"]);
+    }
+
+    #[test]
+    fn licensed_only_hides_titles_without_entitlement() {
+        let title = |id: &str, has_entitlement: bool| xcloud_proto::models::XCloudTitleDTO {
+            title_id: id.into(),
+            product_id: id.into(),
+            has_entitlement,
+            ..Default::default()
+        };
+        let titles = XCloudTitlesResponse {
+            results: vec![title("A", true), title("B", false), title("C", true)],
+        };
+        let mru = XCloudTitlesResponse {
+            results: vec![title("B", false), title("A", true)],
+        };
+
+        let mut inner = Inner::default();
+        let product_ids = inner.adopt_titles(&titles, Some(&mru));
+        assert_eq!(inner.raw_items.len(), 3, "everything is listed by default");
+        assert!(product_ids.iter().any(|id| id == "B"));
+
+        inner.licensed_only = true;
+        let product_ids = inner.adopt_titles(&titles, Some(&mru));
+        let ids: Vec<_> = inner
+            .raw_items
+            .iter()
+            .map(|item| item.title_id.as_str())
+            .collect();
+        assert_eq!(ids, ["A", "C"]);
+        assert!(!product_ids.iter().any(|id| id == "B"));
+        inner.build_shelves();
+        let recent: Vec<_> = inner.shelf_items[SHELF_MRU]
+            .iter()
+            .map(|c| c.title_id.as_str())
+            .collect();
+        assert_eq!(recent, ["A"], "unlicensed recent titles are hidden too");
     }
 
     use std::time::{Duration, Instant};

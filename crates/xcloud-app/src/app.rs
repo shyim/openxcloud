@@ -181,6 +181,9 @@ impl App {
         let (library, library_snapshot, library_commands) = Handle::new(LibrarySnapshot::default());
         // Store text in the user's language (queued before the first refresh).
         library.send(LibraryCommand::SetLocale(settings.read().locale.clone()));
+        library.send(LibraryCommand::SetLicensedOnly(
+            settings.read().licensed_only,
+        ));
         LibraryController::new(
             Arc::clone(&services.api),
             Some(Arc::clone(&services.catalog)),
@@ -431,12 +434,23 @@ impl App {
     /// A settings-panel change: publish it, re-apply the live settings
     /// (`StreamController::applySettings` / `refreshPreferences`) and save.
     fn apply_settings(&mut self, settings: AppSettings) {
-        let locale_changed = self.controllers.settings.read().locale != settings.locale;
+        let (locale_changed, licensed_only_changed) = {
+            let current = self.controllers.settings.read();
+            (
+                current.locale != settings.locale,
+                current.licensed_only != settings.licensed_only,
+            )
+        };
         *self.controllers.settings.write() = settings.clone();
         if locale_changed {
             self.controllers
                 .library
                 .send(LibraryCommand::SetLocale(settings.locale.clone()));
+        }
+        if licensed_only_changed {
+            self.controllers
+                .library
+                .send(LibraryCommand::SetLicensedOnly(settings.licensed_only));
         }
         if let Some(services) = &self.services {
             services.apply_preferences(&settings);

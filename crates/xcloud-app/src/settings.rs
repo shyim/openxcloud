@@ -72,6 +72,7 @@ pub const LABEL_UPSCALE: &str = "Upscaler";
 pub const LABEL_UPSCALER_KIND: &str = "Upscaling method";
 pub const LABEL_SHARPNESS: &str = "Sharpness";
 pub const LABEL_HARDWARE_DECODE: &str = "Hardware decoding";
+pub const LABEL_LICENSED_ONLY: &str = "Only games I can play";
 
 // ----------------------------------------------------------------------------- paths
 
@@ -100,6 +101,7 @@ struct SettingsFile {
     stream: StreamGroup,
     input: InputGroup,
     render: RenderGroup,
+    library: LibraryGroup,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -157,6 +159,13 @@ struct RenderGroup {
     hardware_decode: Option<bool>,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct LibraryGroup {
+    /// `library/licensedOnly` (new).
+    licensed_only: Option<bool>,
+}
+
 impl SettingsFile {
     fn from_settings(s: &AppSettings) -> Self {
         Self {
@@ -184,6 +193,9 @@ impl SettingsFile {
                 sharpness: Some(s.sharpness),
                 upscaler: Some(s.upscaler.clone()),
                 hardware_decode: Some(s.hardware_decode),
+            },
+            library: LibraryGroup {
+                licensed_only: Some(s.licensed_only),
             },
         }
     }
@@ -228,6 +240,7 @@ impl SettingsFile {
             sharpness: self.render.sharpness.unwrap_or(d.sharpness),
             upscaler: normalize_upscaler(self.render.upscaler.as_deref().unwrap_or(&d.upscaler)),
             hardware_decode: self.render.hardware_decode.unwrap_or(d.hardware_decode),
+            licensed_only: self.library.licensed_only.unwrap_or(d.licensed_only),
         }
     }
 }
@@ -510,6 +523,7 @@ mod tests {
             sharpness: 1.5,
             upscaler: "metalfx".into(),
             hardware_decode: true,
+            licensed_only: true,
         };
         let parsed = from_json(&to_json(&settings)).expect("valid json");
         assert_eq!(parsed, settings);
