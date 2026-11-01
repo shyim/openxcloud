@@ -1411,7 +1411,11 @@ mod tests {
 
     #[test]
     fn failed_candidate_is_retried_after_ttl_even_when_kept_on_screen() {
-        let ttl = Duration::from_millis(60);
+        // The failure is stamped on the worker before `wait` returns, so `start` below
+        // trails it by scheduler latency. Keep the on-screen window far below the TTL so
+        // a slow CI runner can't age the failure out mid-check.
+        let ttl = Duration::from_millis(500);
+        let on_screen = Duration::from_millis(50);
         let h = Harness::with_failure_policy(
             temp_dir("fail-ttl"),
             DEFAULT_TEXTURE_BUDGET_BYTES,
@@ -1428,7 +1432,7 @@ mod tests {
 
         // Kept on screen: requested every few ms, still failed, no refetch before the TTL.
         let start = Instant::now();
-        while start.elapsed() < ttl / 2 {
+        while start.elapsed() < on_screen {
             assert!(
                 h.cache
                     .request(std::slice::from_ref(&url), ArtworkKind::Tile, 64)
