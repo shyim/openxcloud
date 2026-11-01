@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories: ["/", "/.github/actions/*"]
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Minor/patch bumps land as one PR so CI (and its cache) churns once a week.
+      cargo-minor:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5

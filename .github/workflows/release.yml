@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check tag matches Cargo version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -29,21 +29,20 @@ jobs:
           if tag != f'v{version}':
               raise SystemExit(f'Tag {tag} does not match Cargo version {version}')
           PY
-  desktop:
+  ci:
     needs: version
-    uses: ./.github/workflows/desktop.yml
-  transport:
-    needs: version
-    uses: ./.github/workflows/transport.yml
+    uses: ./.github/workflows/ci.yml
+    with:
+      package: true
   publish:
-    needs: [desktop, transport]
+    needs: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
       - name: Download packages from this run
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: OpenXCloud-*
           merge-multiple: true

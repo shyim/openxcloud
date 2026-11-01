@@ -1,0 +1,135 @@
+name: CI
+on:
+  push:
+    # Branch pushes are covered by their pull request; building both doubles the load.
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      package:
+        description: Build native packages and upload them as artifacts.
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  # Called from release.yml the caller's workflow name differs, so groups never collide.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are never reused across CI runs; they only bloat the cache.
+  CARGO_INCREMENTAL: 0
+  # No debuginfo for dev/test builds: faster codegen and linking, smaller cache.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUST_TOOLCHAIN: '1.99.1'
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+  HOMEBREW_NO_ANALYTICS: 1
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  check:
+    name: Clippy and tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: ./.github/actions/native-deps
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          # PRs restore main's cache but never write their own; that keeps the 10 GB
+          # repository cache from being evicted by short-lived branches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Generate synthetic video fixture
+        run: bash scripts/generate-test-fixture.sh
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --locked --workspace --all-targets --all-features
+
+  transport:
+    # Linux and macOS run these crates inside the full workspace tests above.
+    name: Portable transport (windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: transport
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Protocol and local WebRTC integration tests
+        run: cargo test --locked -p xcloud-proto -p xcloud-webrtc
+
+  package:
+    name: Package (${{ matrix.os }})
+    # Release builds are the slowest part of CI; only build them where they are used.
+    if: >-
+      inputs.package ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [fmt, check]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: ./.github/actions/native-deps
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: package
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Cache cargo-bundle
+        id: cargo-bundle
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-bundle
+          key: cargo-bundle-0.12.0-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
+      - name: Install cargo-bundle
+        if: steps.cargo-bundle.outputs.cache-hit != 'true'
+        run: cargo install cargo-bundle --version 0.12.0 --locked
+      - name: Package desktop app
+        run: bash scripts/package.sh
+      - name: Upload native package
+        uses: actions/upload-artifact@v5
+        with:
+          name: OpenXCloud-${{ matrix.os }}-${{ runner.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
