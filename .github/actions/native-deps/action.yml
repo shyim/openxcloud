@@ -3,6 +3,32 @@ description: Install the system libraries the desktop workspace links against (F
 runs:
   using: composite
   steps:
+    - name: Install Windows dependencies
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        # BtbN's month-end autobuilds stay published (daily ones are pruned after about
+        # two weeks). LGPL shared build of the FFmpeg 9 branch (ffmpeg-sys-next 9).
+        # To bump: pick a newer month-end `autobuild-*` release, copy the asset URL and
+        # its SHA-256 (shown on the release page), and check the DLL majors still match.
+        FFMPEG_ARCHIVE_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/ffmpeg-n9.0.2-39-g7adfbe40dc-win64-lgpl-shared-9.0.zip
+        FFMPEG_ARCHIVE_SHA256: e907b01fa4783913151237e37df2a10fa97d99a1598a021bf59d4ae62ffed4c0
+      run: |
+        $ProgressPreference = 'SilentlyContinue'
+        $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg.zip'
+        Invoke-WebRequest -Uri $env:FFMPEG_ARCHIVE_URL -OutFile $zip
+        $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($hash -ne $env:FFMPEG_ARCHIVE_SHA256) { throw "FFmpeg archive SHA-256 $hash does not match the pinned value" }
+        $dest = Join-Path $env:RUNNER_TEMP 'ffmpeg'
+        Expand-Archive -Path $zip -DestinationPath $dest
+        $root = (Get-ChildItem $dest -Directory | Select-Object -First 1).FullName
+        # ffmpeg-sys-next finds the libraries through FFMPEG_DIR and runs bindgen,
+        # which needs libclang (LLVM is preinstalled on the Windows images).
+        "FFMPEG_DIR=$root" >> $env:GITHUB_ENV
+        "FFMPEG_ARCHIVE_URL=$env:FFMPEG_ARCHIVE_URL" >> $env:GITHUB_ENV
+        "FFMPEG_ARCHIVE_SHA256=$env:FFMPEG_ARCHIVE_SHA256" >> $env:GITHUB_ENV
+        "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+        Join-Path $root 'bin' >> $env:GITHUB_PATH
     - name: Install Linux dependencies
       if: runner.os == 'Linux'
       shell: bash

@@ -50,9 +50,10 @@ jobs:
       - name: Verify packages and create checksums
         working-directory: dist
         run: |
-          test -s OpenXCloud-macos-arm64.zip
-          test -s OpenXCloud-linux-amd64.deb
-          sha256sum OpenXCloud-macos-arm64.zip OpenXCloud-linux-amd64.deb > SHA256SUMS
+          assets=(OpenXCloud-macos-arm64.zip OpenXCloud-linux-amd64.deb
+            OpenXCloud-windows-x64-setup.exe OpenXCloud-windows-x64.zip)
+          for asset in "${assets[@]}"; do test -s "$asset"; done
+          sha256sum "${assets[@]}" > SHA256SUMS
       - name: Upload assets and publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -73,8 +74,10 @@ jobs:
             fi
             gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes \
               --title "OpenXCloud $RELEASE_TAG" "${prerelease[@]}" \
-              --notes 'macOS: Apple Silicon app, ad-hoc signed and not notarized. Linux: amd64 Debian package built on Ubuntu 24.04. See PACKAGING.md at this tag for platform requirements.'
+              --notes 'macOS: Apple Silicon app, ad-hoc signed and not notarized. Linux: amd64 Debian package built on Ubuntu 24.04. Windows: x64 installer and portable ZIP, not code-signed, so SmartScreen warns on first run. See PACKAGING.md at this tag for platform requirements.'
           fi
           gh release upload "$RELEASE_TAG" \
-            dist/OpenXCloud-macos-arm64.zip dist/OpenXCloud-linux-amd64.deb dist/SHA256SUMS --clobber
+            dist/OpenXCloud-macos-arm64.zip dist/OpenXCloud-linux-amd64.deb \
+            dist/OpenXCloud-windows-x64-setup.exe dist/OpenXCloud-windows-x64.zip \
+            dist/SHA256SUMS --clobber
           gh release edit "$RELEASE_TAG" --draft=false

@@ -11,6 +11,9 @@
 //!   The upscaler is selectable at runtime ([`Upscaler`]: FSR, MetalFX, bypass).
 //! * [`metalfx`]: the Qt item's `MTLFXSpatialScaler` on wgpu's Metal device/command
 //!   buffer, behind `--features metalfx` (macOS); stubs elsewhere.
+//! * [`vsr`]: NVIDIA RTX / Intel Video Super Resolution through the D3D11 video processor
+//!   driver extensions, rendering into a texture shared with wgpu's DX12 device, behind
+//!   `--features vsr` (Windows); stubs elsewhere.
 //! * [`egui_glue`]: the output texture as an `egui::TextureId`, drawn letterboxed.
 //!
 //! The renderer never waits on the GPU in the common case: imported frames stay alive
@@ -21,9 +24,10 @@ pub mod error;
 pub mod import;
 pub mod metalfx;
 pub mod renderer;
+pub mod vsr;
 
 pub use egui_glue::{VideoTexture, letterbox};
-pub use error::{Error, MetalFxError, Result};
+pub use error::{Error, MetalFxError, Result, VsrError};
 pub use import::{FORCE_CPU_UPLOAD_ENV, FrameImporter, ImportedFrame};
 pub use renderer::{
     DEFAULT_SHARPNESS, DISABLE_UPSCALE_ENV, GpuTimings, MAX_IN_FLIGHT, TARGET_HEIGHT, TARGET_WIDTH,

@@ -91,6 +91,32 @@ jobs:
       - name: Protocol and local WebRTC integration tests
         run: cargo test --locked -p xcloud-proto -p xcloud-webrtc
 
+  desktop-windows:
+    # The desktop app and the video super resolution path (D3D11 video processor ↔ wgpu
+    # DX12) only compile for real on Windows; Linux and macOS check the VSR stubs.
+    # Runners have no GPU, so the hardware tests skip. The app is linted without
+    # --all-targets: its media tests embed an x264 fixture the LGPL FFmpeg cannot encode.
+    name: Desktop build (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: ./.github/actions/native-deps
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy (app)
+        run: cargo clippy --locked -p xcloud-app --all-features -- -D warnings
+      - name: Clippy (GPU path, all targets)
+        run: cargo clippy --locked -p xcloud-gpu --all-targets --features vsr -- -D warnings
+      - name: Tests (GPU path)
+        run: cargo test --locked -p xcloud-gpu --features vsr --lib
+
   package:
     name: Package (${{ matrix.os }})
     # Release builds are the slowest part of CI; only build them where they are used.
@@ -98,13 +124,13 @@ jobs:
       inputs.package ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    needs: [fmt, check]
+    needs: [fmt, check, desktop-windows]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-24.04, macos-15, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -116,20 +142,43 @@ jobs:
           shared-key: package
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Cache cargo-bundle
+        if: runner.os != 'Windows'
         id: cargo-bundle
         uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-bundle
           key: cargo-bundle-0.12.0-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}
       - name: Install cargo-bundle
-        if: steps.cargo-bundle.outputs.cache-hit != 'true'
+        if: runner.os != 'Windows' && steps.cargo-bundle.outputs.cache-hit != 'true'
         run: cargo install cargo-bundle --version 0.12.0 --locked
       - name: Package desktop app
+        if: runner.os != 'Windows'
         run: bash scripts/package.sh
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe
+          INNO_SHA256: a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
+          Invoke-WebRequest -Uri $env:INNO_URL -OutFile $setup
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:INNO_SHA256) { throw "Inno Setup SHA-256 $hash does not match the pinned value" }
+          # Portable mode: no registry entries, no file associations.
+          $dir = Join-Path $env:RUNNER_TEMP 'inno'
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', '/PORTABLE=1', "/DIR=$dir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Inno Setup install exited with $($p.ExitCode)" }
+          "ISCC=$dir\ISCC.exe" >> $env:GITHUB_ENV
+      - name: Package desktop app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
       - name: Upload native package
         uses: actions/upload-artifact@v7
         with:
           name: OpenXCloud-${{ matrix.os }}-${{ runner.arch }}
-          path: dist/*
+          path: dist/OpenXCloud-*
           if-no-files-found: error
           retention-days: 14

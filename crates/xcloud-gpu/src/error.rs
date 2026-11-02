@@ -31,6 +31,46 @@ pub enum Error {
     /// surfaces this itself: it logs the reason and falls back to FSR 1.0.
     #[error("MetalFX: {0}")]
     MetalFx(#[from] MetalFxError),
+
+    /// The driver video super resolution path could not be created or run. Like
+    /// [`Error::MetalFx`], the renderer logs it and falls back to FSR 1.0.
+    #[error("video super resolution: {0}")]
+    Vsr(#[from] VsrError),
+}
+
+/// Why the D3D11 video processor super resolution path (`crate::vsr`) could not be
+/// created or run; wraps into [`Error::Vsr`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum VsrError {
+    /// Built without `--features vsr`, or not on Windows.
+    #[error("not compiled in (build xcloud-gpu with `--features vsr` on Windows)")]
+    NotCompiled,
+    /// wgpu is not running on the DX12 backend, so there is nothing to share with D3D11.
+    #[error("wgpu is not running on the DX12 backend")]
+    NotDx12,
+    /// The adapter is neither NVIDIA nor Intel; no driver super resolution extension.
+    #[error("adapter vendor {0:#06x} has no video super resolution extension")]
+    UnsupportedVendor(u32),
+    /// A D3D11/D3D12/DXGI call failed.
+    #[error("{what} failed with HRESULT {hresult:#010x}")]
+    Os { what: &'static str, hresult: u32 },
+    /// The video processor cannot read NV12 or write `R8G8B8A8_UNORM` for these sizes.
+    #[error("video processor does not support {0}")]
+    Format(&'static str),
+    /// The frame is not NV12 in CPU memory at the scaler's size (the only input this path
+    /// uploads).
+    #[error("frame is not NV12 in CPU memory at the scaler's size")]
+    NotCpuFrame,
+    /// The driver accepted the extension but left a test frame unchanged: super
+    /// resolution is off in its settings (or unavailable for this size / power state).
+    #[error(
+        "the {vendor} driver did not upscale a test frame ({changed_permille}‰ of samples changed); \
+         turn on video super resolution in the driver settings (NVIDIA app → Graphics → RTX Video)"
+    )]
+    DriverInactive {
+        vendor: &'static str,
+        changed_permille: u32,
+    },
 }
 
 /// Why a MetalFX scaler could not be created or encoded (`crate::metalfx`). Kept as its

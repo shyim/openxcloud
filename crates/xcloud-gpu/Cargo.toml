@@ -27,6 +27,22 @@ metalfx = [
     "objc2-metal/objc2-core-foundation",
 ]
 
+# NVIDIA RTX / Intel Video Super Resolution through the D3D11 video processor driver
+# extensions, sharing its output with wgpu's DX12 device. Windows only; a no-op elsewhere.
+vsr = ["dep:windows"]
+
+[target.'cfg(windows)'.dependencies]
+# Same major as wgpu-hal's DX12 backend, so `ID3D12Device` & co. are the same types.
+windows = { workspace = true, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
 objc2-core-foundation = { workspace = true }
