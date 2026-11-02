@@ -1,0 +1,21 @@
+name: Native build dependencies
+description: Install the system libraries the desktop workspace links against (FFmpeg, ALSA, Vulkan, X11/Wayland).
+runs:
+  using: composite
+  steps:
+    - name: Install Linux dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # Skip man-db's index rebuild on every package install (~30s+ on hosted runners).
+        sudo rm -f /var/lib/man-db/auto-update
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends \
+          build-essential pkg-config cmake clang libclang-dev ffmpeg dpkg-dev libssl-dev python3 \
+          libasound2-dev libudev-dev libavcodec-dev libavformat-dev libavutil-dev \
+          libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
+          libx11-dev libxkbcommon-dev libwayland-dev libvulkan1 mesa-vulkan-drivers
+    - name: Install macOS dependencies
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install ffmpeg cmake pkg-config llvm dylibbundler

@@ -52,14 +52,22 @@ desktop session are required for playback.
 
 ## GitHub Actions
 
-- `desktop.yml`: macOS/Linux formatting, workspace tests, Clippy, native packages,
-  and downloadable artifacts retained for 14 days. Runs on pushes, pull requests,
-  and manual dispatch. The synthetic H.264 test fixture is generated with FFmpeg.
-- `transport.yml`: protocol and WebRTC tests on macOS, Linux, and Windows.
-
-- `release.yml`: pushing a version tag such as `v0.1.0` runs both reusable check
-  workflows, then uploads the macOS Apple Silicon ZIP, Ubuntu 24.04 amd64 `.deb`,
+- `ci.yml`: runs on pull requests, pushes to `main`, merge queues and manual dispatch.
+  - `Format`: `cargo fmt --check` (no native dependencies, finishes in seconds).
+  - `Clippy and tests`: Clippy and the full workspace test suite on Linux and macOS.
+    The synthetic H.264 test fixture is generated with FFmpeg.
+  - `Portable transport`: protocol and WebRTC tests on Windows.
+  - `Package`: native packages, uploaded as artifacts retained for 14 days. Built only
+    on pushes to `main`, manual dispatch, and releases, never for pull requests.
+  - Native libraries come from the shared `.github/actions/native-deps` action.
+  - Build caching uses [`Swatinem/rust-cache`](https://github.com/Swatinem/rust-cache).
+    Only `main` writes caches; pull requests and tags restore them read-only so
+    short-lived branches don't evict the repository's 10 GB cache. `cargo-bundle` is
+    cached separately instead of being compiled on every package run.
+- `release.yml`: pushing a version tag such as `v0.1.0` runs `ci.yml` with packaging
+  enabled, then uploads the macOS Apple Silicon ZIP, Ubuntu 24.04 amd64 `.deb`,
   and `SHA256SUMS` to a GitHub Release. Only the publish job has write permission.
+- `dependabot.yml`: weekly grouped updates for GitHub Actions and Cargo dependencies.
 
 ### Publish a release
 
@@ -76,7 +84,7 @@ The tag must match the Cargo version exactly. Tags containing a prerelease suffi
 produce CI artifacts. No additional token or signing secret is required: the
 publish job uses GitHub's built-in `GITHUB_TOKEN`.
 
-Both platforms and transport tests must succeed before a draft release is created.
+All CI checks and both packages must succeed before a draft release is created.
 The draft becomes public only after all three assets upload. If uploading fails,
 rerun the failed jobs to finish the draft. Published release assets are never
 replaced by a rerun; use a new version tag for corrections. Downloaded packages
