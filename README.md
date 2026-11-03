@@ -18,7 +18,7 @@ A native Rust client with a game-first library, GPU upscaling, and streaming sta
 
 - **Your next game, easy to find.** Browse the cloud library, search by name, and narrow the list by genre, player count, touch support, or game features.
 - **Pick up where you left off.** Recently played games live in the sidebar. Save favourites with a heart and get recommendations based on what you play.
-- **Choose your output resolution.** Upscale to **1080p, 1440p, or 4K** with AMD FSR 1.0 or optional Apple MetalFX. Adjust sharpness and change the target while playing.
+- **Choose your output resolution.** Upscale to **1080p, 1440p, or 4K** with AMD FSR 1.0, optional Apple MetalFX, or optional NVIDIA RTX / Intel Video Super Resolution on Windows. Adjust sharpness and change the target while playing.
 - **See what the stream is doing.** Check FPS, bitrate, network latency, and decode/GPU timings. Expand the overlay for recovery counters and 60-second performance graphs.
 - **Play with your preferred controls.** Use a supported controller with rumble, or the keyboard's virtual-controller mapping. Tune deadzones, triggers, and button layout.
 - **A native streaming stack.** webrtc-rs handles transport, H.264 and Opus handle video and audio, and wgpu renders the stream. Credentials stay in the operating system's credential store.
@@ -44,9 +44,11 @@ To include Apple's MetalFX upscaler:
 cargo run --locked --release -p xcloud-app --features metalfx
 ```
 
+On Windows, the upscaler setting also offers driver **Video Super Resolution** (NVIDIA RTX 20-series or newer, or recent Intel GPUs). It runs through the D3D11 video processor on the DX12 adapter. For NVIDIA, also turn on **RTX Video → Super resolution** in the NVIDIA app or Control Panel. OpenXCloud checks with a test frame whether the driver actually upscales, and uses FSR 1.0 when it does not (setting off, another app using it, or very small streams).
+
 Rustup selects the version pinned in [`rust-toolchain.toml`](rust-toolchain.toml). The built application binary is `target/release/openxcloud`.
 
-See the [packaging guide](PACKAGING.md) for Linux prerequisites and native packages. GitHub Actions produces macOS `.app` archives and Linux `.deb` artifacts. Development binaries still require their native runtime libraries.
+See the [packaging guide](PACKAGING.md) for Linux and Windows prerequisites and native packages. GitHub Actions produces macOS `.app` archives, Linux `.deb` packages, and a Windows installer plus portable ZIP. Development binaries still require their native runtime libraries.
 
 ### Start playing
 
@@ -63,7 +65,7 @@ Local upscaling preserves the source aspect ratio and never downscales a larger 
 | --- | --- | --- |
 | **macOS** | Primary development platform; app packaging available; signing and clean-machine validation pending | VideoToolbox with FFmpeg fallback; FSR 1.0 and optional MetalFX |
 | **Linux** | Workspace compilation checked; desktop and live-stream validation ongoing | FFmpeg and wgpu; FSR 1.0 |
-| **Windows** | Implementation present; native desktop build and playback validation pending | FFmpeg and wgpu; FSR 1.0 |
+| **Windows** | Desktop build and live streaming validated on an RTX 4070 Ti; Inno Setup installer and portable ZIP (not code-signed) | FFmpeg and wgpu (DX12 preferred); FSR 1.0 and NVIDIA/Intel Video Super Resolution |
 
 The repository includes desktop CI checks for macOS/Linux and transport tests for all three platforms. Build and loopback checks are only part of release validation.
 

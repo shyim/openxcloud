@@ -430,7 +430,7 @@ fn video(ui: &mut Ui, s: &mut AppSettings) -> bool {
         );
         caption(ui, LABEL_UPSCALER_KIND);
         let current = crate::settings::normalize_upscaler(&s.upscaler);
-        for (value, title, subtitle) in [
+        let cards = [
             (
                 "fsr",
                 "FSR 1.0",
@@ -441,7 +441,19 @@ fn video(ui: &mut Ui, s: &mut AppSettings) -> bool {
                 "MetalFX",
                 "Apple's spatial scaler (falls back to FSR when unavailable)",
             ),
-        ] {
+            (
+                "vsr",
+                "Video Super Resolution",
+                "NVIDIA RTX / Intel driver AI upscaling; turn on RTX Video Super resolution in the NVIDIA app (falls back to FSR when off)",
+            ),
+        ];
+        // VSR only exists on Windows; elsewhere the panel keeps its two cards.
+        let shown = if cfg!(windows) {
+            &cards[..]
+        } else {
+            &cards[..2]
+        };
+        for &(value, title, subtitle) in shown {
             if kit::radio_card(ui, current == value, title, subtitle).clicked() && current != value
             {
                 s.upscaler = value.to_owned();

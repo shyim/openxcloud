@@ -50,6 +50,60 @@ on a compatible distribution. Packages are tied to their build distro and
 architecture; they are not portable Linux binaries. A working graphics driver and
 desktop session are required for playback.
 
+## Windows (x64)
+
+Windows uses its own script, run from PowerShell (5.1 or 7) on Windows 10/11:
+
+```powershell
+$env:FFMPEG_DIR = 'C:\path\to\ffmpeg-n9.0.2-...-win64-lgpl-shared-9.0'
+$env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
+.\scripts\package-windows.ps1
+```
+
+Prerequisites: Rust with the MSVC toolchain and the Windows SDK (Visual Studio Build
+Tools; `rc.exe` embeds the icon, version info and manifest), LLVM for bindgen,
+[Inno Setup 6](https://jrsoftware.org/isinfo.php) (or pass `-Iscc path\to\ISCC.exe`),
+and an FFmpeg 9 **shared** build. CI uses the LGPL shared build from
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds), pinned by URL and SHA-256
+in `.github/actions/native-deps/action.yml`. BtbN keeps month-end builds published, so
+bump the pin to another month-end `autobuild-*` release.
+
+Outputs in `dist/`:
+
+- `OpenXCloud-windows-x64-setup.exe`: Inno Setup installer
+  (`packaging/windows/openxcloud.iss`). Installs per user without admin rights by
+  default; its first page also offers an all-users install. Adds a Start menu entry,
+  an optional desktop shortcut, an uninstaller, and an Apps & features entry.
+  Re-running a newer installer upgrades in place and closes a running OpenXCloud
+  first. `/VERYSILENT` (add `/ALLUSERS` or `/CURRENTUSER`) installs unattended.
+  Uninstalling keeps settings, sign-in tokens (Windows Credential Manager) and logs.
+- `OpenXCloud-windows-x64.zip`: the same files as a portable folder.
+
+What the script does:
+
+1. Builds with the static MSVC runtime (`+crt-static`, in `target\windows-package`),
+   so no Visual C++ redistributable is needed.
+2. Reads the PE import tables of the exe and, transitively, of every DLL it bundles.
+   It copies the FFmpeg DLLs that are actually imported and fails on any other
+   non-system DLL (including `vcruntime140.dll`).
+3. Adds `LICENSE.txt`, `THIRD_PARTY_NOTICES.md`, FFmpeg's licence, and
+   `licenses\FFmpeg-BUILD.txt`, which records the exact FFmpeg build (version,
+   configure line, archive URL and SHA-256) and its source location.
+4. Starts the staged `openxcloud.exe --version` once. A missing DLL fails process
+   creation, so this proves the bundle is complete.
+5. Zips the folder and compiles the installer.
+
+Release builds use the GUI subsystem (no console window). Started from a terminal,
+the app attaches to it, so `--help`, `--smoke` and the stderr log still show.
+Requirements: 64-bit Windows 10 1809 or newer. NVIDIA/Intel Video Super Resolution
+needs the DX12 adapter and the driver setting (see the README).
+
+The installer and the exe are **not code-signed**. SmartScreen shows "Windows
+protected your PC" until the publisher has reputation. Signing needs a code-signing
+certificate (for example Azure Trusted Signing) and a `signtool sign` step over
+`openxcloud.exe` and the setup exe. Inno Setup is free for non-commercial use, which
+covers this project; check its licence before reusing the script commercially.
+
 ## GitHub Actions
 
 - `ci.yml`: runs on pull requests, pushes to `main`, merge queues and manual dispatch.
@@ -57,8 +111,13 @@ desktop session are required for playback.
   - `Clippy and tests`: Clippy and the full workspace test suite on Linux and macOS.
     The synthetic H.264 test fixture is generated with FFmpeg.
   - `Portable transport`: protocol and WebRTC tests on Windows.
-  - `Package`: native packages, uploaded as artifacts retained for 14 days. Built only
-    on pushes to `main`, manual dispatch, and releases, never for pull requests.
+  - `Desktop build (windows)`: Clippy for the desktop app against the pinned FFmpeg,
+    plus Clippy and tests for the GPU crate with Video Super Resolution compiled in.
+    Runners have no GPU, so the hardware tests skip.
+  - `Package`: native packages for macOS, Linux and Windows, uploaded as artifacts
+    retained for 14 days. Built only on pushes to `main`, manual dispatch, and
+    releases, never for pull requests. Inno Setup is pinned by URL and SHA-256 and
+    installed in portable mode.
   - Native libraries come from the shared `.github/actions/native-deps` action.
   - Build caching uses [`Swatinem/rust-cache`](https://github.com/Swatinem/rust-cache).
     Only `main` writes caches; pull requests and tags restore them read-only so
@@ -66,7 +125,7 @@ desktop session are required for playback.
     cached separately instead of being compiled on every package run.
 - `release.yml`: pushing a version tag such as `v0.1.0` runs `ci.yml` with packaging
   enabled, then uploads the macOS Apple Silicon ZIP, Ubuntu 24.04 amd64 `.deb`,
-  and `SHA256SUMS` to a GitHub Release. Only the publish job has write permission.
+  Windows x64 installer and portable ZIP, and `SHA256SUMS` to a GitHub Release. Only the publish job has write permission.
 - `dependabot.yml`: weekly grouped updates for GitHub Actions and Cargo dependencies.
 
 ### Publish a release
@@ -84,15 +143,13 @@ The tag must match the Cargo version exactly. Tags containing a prerelease suffi
 produce CI artifacts. No additional token or signing secret is required: the
 publish job uses GitHub's built-in `GITHUB_TOKEN`.
 
-All CI checks and both packages must succeed before a draft release is created.
-The draft becomes public only after all three assets upload. If uploading fails,
+All CI checks and all three platform packages must succeed before a draft release is
+created. The draft becomes public only after all five assets upload. If uploading fails,
 rerun the failed jobs to finish the draft. Published release assets are never
 replaced by a rerun; use a new version tag for corrections. Downloaded packages
 can be checked with `sha256sum -c SHA256SUMS` (macOS: `shasum -a 256 -c SHA256SUMS`).
 
-Publishing does not add Developer ID signing or notarization. Windows desktop
-packaging is pending native build and playback validation; its transport CI is not
-a desktop compatibility guarantee.
+Publishing does not add Developer ID signing, notarization or Windows code signing.
 
 For local workspace tests, first run `bash scripts/generate-test-fixture.sh`.
 The generated video stays ignored by Git; no account or recorded stream is needed.

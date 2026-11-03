@@ -54,8 +54,9 @@ pub const FRAME_RATES: [i32; 2] = [30, 60];
 /// `AppSettings::present_mode` values: lowest latency first.
 pub const PRESENT_MODES: [&str; 2] = ["immediate", "fifo"];
 /// `AppSettings::upscaler` values (`xcloud_gpu::Upscaler::as_str`): FSR 1.0 (default) and
-/// MetalFX (macOS with `--features metalfx`; the renderer falls back to FSR otherwise).
-pub const UPSCALERS: [&str; 2] = ["fsr", "metalfx"];
+/// MetalFX (macOS with `--features metalfx`) and driver video super resolution (Windows with
+/// `--features vsr`); the renderer falls back to FSR when the chosen one is unavailable.
+pub const UPSCALERS: [&str; 3] = ["fsr", "metalfx", "vsr"];
 
 /// Accessible labels of the panel's widgets (what the tests query).
 pub const LABEL_RESOLUTION: &str = "Resolution profile";
@@ -316,11 +317,13 @@ pub fn normalize_upscale_height(height: u32) -> u32 {
 }
 
 /// `AppSettings::upscaler` → one of [`UPSCALERS`]. Accepts what `xcloud_gpu::Upscaler::parse`
-/// accepts for the two (`fsr`, `fsr1`, `metalfx`, `metal-fx`, `fx`), case-insensitively;
+/// accepts for the three (`fsr`, `fsr1`, `metalfx`, `metal-fx`, `fx`, `vsr`, `rtx`, `rtx-vsr`),
+/// case-insensitively;
 /// anything else (including `bypass`, which is `upscale_enabled = false` here) becomes `fsr`.
 pub fn normalize_upscaler(name: &str) -> String {
     match name.trim().to_ascii_lowercase().as_str() {
         "metalfx" | "metal-fx" | "fx" => "metalfx",
+        "vsr" | "rtx" | "rtx-vsr" => "vsr",
         _ => "fsr",
     }
     .to_owned()
@@ -549,6 +552,8 @@ mod tests {
         assert_eq!(normalize_upscaler("MetalFX"), "metalfx");
         assert_eq!(normalize_upscaler(" fx "), "metalfx");
         assert_eq!(normalize_upscaler("fsr"), "fsr");
+        assert_eq!(normalize_upscaler("RTX"), "vsr");
+        assert_eq!(normalize_upscaler(" vsr "), "vsr");
         assert_eq!(
             normalize_upscaler("bypass"),
             "fsr",

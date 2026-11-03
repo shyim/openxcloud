@@ -300,7 +300,10 @@ impl GpuVideo {
 
     /// Parks a replaced renderer until its in-flight frames are done (see
     /// [`GpuVideo::after_submit`]). Nothing to wait for: dropped right away.
-    fn retire(&mut self, old: VideoRenderer) {
+    fn retire(&mut self, mut old: VideoRenderer) {
+        // The NVIDIA driver super-resolves one video processor at a time: free the old
+        // one before the new renderer creates (and checks) its own.
+        old.release_vsr();
         if old.in_flight() == 0 {
             return;
         }
@@ -2465,6 +2468,7 @@ mod tests {
             assert_eq!(vr.upscaler(), Upscaler::MetalFx);
             let expected = match vr.active_upscaler() {
                 Upscaler::MetalFx => "FX",
+                Upscaler::Vsr => "VSR",
                 Upscaler::Fsr => "FSR",
                 Upscaler::Bypass => "",
             };

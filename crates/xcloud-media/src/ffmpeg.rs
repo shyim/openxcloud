@@ -676,7 +676,7 @@ fn convert_frame(
     t_submitted: Instant,
     t_decoded: Instant,
 ) -> std::result::Result<Option<Frame>, ffmpeg::Error> {
-    use ffmpeg::format::Pixel;
+    use ffmpeg::util::format::Pixel;
 
     let width = codec.frame.width();
     let height = codec.frame.height();
@@ -769,8 +769,8 @@ fn nv12_from_software_frame(
     sws: &mut Option<ffmpeg::software::scaling::Context>,
     sws_out: &mut ffmpeg::frame::Video,
 ) -> std::result::Result<NativeBuffer, ffmpeg::Error> {
-    use ffmpeg::format::Pixel;
     use ffmpeg::software::scaling::{Context, Flags};
+    use ffmpeg::util::format::Pixel;
 
     match frame.format() {
         Pixel::YUV420P | Pixel::YUVJ420P if frame.planes() >= 3 => Ok(nv12_from_yuv420p(frame)),

@@ -26,6 +26,7 @@ use xcloud_media::{ColorInfo, Frame};
 
 use crate::import::{FrameImporter, ImportedFrame, LOG_TARGET};
 use crate::metalfx::{self, SpatialScaler};
+use crate::vsr::{self, VideoScaler};
 use crate::{Error, Result};
 
 /// WGSL of the NV12 → RGBA kernel (port of the Metal `convertVideo` kernel).
@@ -38,7 +39,7 @@ pub const FSR_RCAS_WGSL: &str = include_str!("shaders/fsr_rcas.wgsl");
 /// Environment variable that disables GPU upscaling.
 pub const DISABLE_UPSCALE_ENV: &str = "OPENXCLOUD_DISABLE_UPSCALE";
 
-/// Environment variable that picks the upscaler: `fsr` (default), `metalfx` or `bypass`.
+/// Environment variable that picks the upscaler: `fsr` (default), `metalfx`, `vsr` or `bypass`.
 pub const UPSCALER_ENV: &str = "OPENXCLOUD_UPSCALER";
 
 /// Which spatial upscaler runs after the NV12 → RGBA pass.
@@ -50,6 +51,10 @@ pub enum Upscaler {
     /// Apple `MTLFXSpatialScaler` (macOS, `--features metalfx`); falls back to [`Upscaler::Fsr`]
     /// when unavailable.
     MetalFx,
+    /// Driver video super resolution (NVIDIA RTX VSR, Intel VSR) through the D3D11 video
+    /// processor (Windows on DX12, `--features vsr`, [`crate::vsr`]); replaces the convert
+    /// pass too. Falls back to [`Upscaler::Fsr`] when unavailable.
+    Vsr,
     /// No upscaling: the output is the converted frame at source size.
     Bypass,
 }
@@ -60,6 +65,7 @@ impl Upscaler {
         match value.trim().to_ascii_lowercase().as_str() {
             "fsr" | "fsr1" | "fsr1.0" => Some(Self::Fsr),
             "metalfx" | "metal-fx" | "fx" => Some(Self::MetalFx),
+            "vsr" | "rtx" | "rtx-vsr" => Some(Self::Vsr),
             "bypass" | "none" | "off" => Some(Self::Bypass),
             _ => None,
         }
@@ -70,6 +76,7 @@ impl Upscaler {
         match self {
             Self::Fsr => "fsr",
             Self::MetalFx => "metalfx",
+            Self::Vsr => "vsr",
             Self::Bypass => "bypass",
         }
     }
@@ -80,6 +87,7 @@ impl Upscaler {
         match self {
             Self::Fsr => "FSR",
             Self::MetalFx => "FX",
+            Self::Vsr => "VSR",
             Self::Bypass => "",
         }
     }
@@ -89,7 +97,7 @@ impl Upscaler {
         let value = std::env::var(UPSCALER_ENV).ok()?;
         let parsed = Self::parse(&value);
         if parsed.is_none() {
-            warn!(target: LOG_TARGET, "{UPSCALER_ENV}={value:?} is not one of fsr|metalfx|bypass; using the default");
+            warn!(target: LOG_TARGET, "{UPSCALER_ENV}={value:?} is not one of fsr|metalfx|vsr|bypass; using the default");
         }
         parsed
     }
@@ -104,15 +112,15 @@ impl Upscaler {
 }
 
 /// Decides what actually runs for one source size: nothing when the policy says the
-/// size is not upscaled, FSR when MetalFX was asked for but is not available (not
-/// compiled in, not Metal, `supportsDevice` false or scaler creation failed), otherwise
-/// what was requested.
-pub fn select_upscaler(requested: Upscaler, upscaled: bool, metalfx_available: bool) -> Upscaler {
+/// size is not upscaled, FSR when a hardware upscaler (MetalFX, VSR) was asked for but
+/// is not available (not compiled in, wrong backend or vendor, scaler creation failed),
+/// otherwise what was requested.
+pub fn select_upscaler(requested: Upscaler, upscaled: bool, hardware_available: bool) -> Upscaler {
     if !upscaled {
         return Upscaler::Bypass;
     }
     match requested {
-        Upscaler::MetalFx if !metalfx_available => Upscaler::Fsr,
+        Upscaler::MetalFx | Upscaler::Vsr if !hardware_available => Upscaler::Fsr,
         other => other,
     }
 }
@@ -293,6 +301,12 @@ impl Target {
             usage,
             view_formats,
         });
+        Self::from_texture(texture, label, width, height)
+    }
+
+    /// Wraps an existing `Rgba8Unorm` texture with `STORAGE_BINDING | TEXTURE_BINDING`
+    /// (the VSR output, which `crate::vsr` creates as a shared D3D12 resource).
+    fn from_texture(texture: wgpu::Texture, label: &str, width: u32, height: u32) -> Self {
         let storage = texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some(label),
             format: Some(wgpu::TextureFormat::Rgba8Unorm),
@@ -584,12 +598,16 @@ pub struct VideoRenderer {
     active: Upscaler,
     /// `metalfx::supported` for this device, computed on first need.
     metalfx_supported: Option<bool>,
-    /// The MetalFX fallback has been logged (once per renderer).
-    metalfx_fallback_logged: bool,
+    /// `vsr::supported` for this device, computed on first need.
+    vsr_supported: Option<bool>,
+    /// The MetalFX / VSR fallback has been logged (once per renderer / upscaler change).
+    fallback_logged: bool,
     /// The MetalFX scaler for the current size (only when `active == MetalFx`).
     scaler: Option<SpatialScaler>,
     /// Scalers replaced since the last `after_submit`, kept alive until the GPU is done.
     retired_scalers: Vec<SpatialScaler>,
+    /// The VSR scaler for the current size (only when `active == Vsr`).
+    vsr: Option<VideoScaler>,
     convert: Pass,
     easu: Pass,
     rcas: Pass,
@@ -709,9 +727,11 @@ impl VideoRenderer {
             upscaler,
             active: Upscaler::Bypass,
             metalfx_supported: None,
-            metalfx_fallback_logged: false,
+            vsr_supported: None,
+            fallback_logged: false,
             scaler: None,
             retired_scalers: Vec::new(),
+            vsr: None,
             convert,
             easu,
             rcas,
@@ -790,7 +810,7 @@ impl VideoRenderer {
     pub fn set_upscaler(&mut self, upscaler: Upscaler) {
         if upscaler != self.upscaler {
             self.upscaler = upscaler;
-            self.metalfx_fallback_logged = false;
+            self.fallback_logged = false;
             // Force `ensure_targets` to rebuild for the current size.
             self.output = None;
         }
@@ -807,11 +827,27 @@ impl VideoRenderer {
         supported
     }
 
-    /// Logs the MetalFX → FSR fallback once per renderer / upscaler change.
-    fn log_metalfx_fallback(&mut self, reason: &dyn std::fmt::Display) {
-        if !self.metalfx_fallback_logged {
-            self.metalfx_fallback_logged = true;
-            warn!(target: LOG_TARGET, "MetalFX requested but unavailable, using FSR 1.0: {reason}");
+    /// Whether driver video super resolution can be used on this device (compiled in,
+    /// DX12 backend, NVIDIA or Intel adapter, D3D11 video device). Cached after the first
+    /// call.
+    pub fn vsr_supported(&mut self) -> bool {
+        if let Some(v) = self.vsr_supported {
+            return v;
+        }
+        let supported = vsr::COMPILED && vsr::supported(&self.device);
+        self.vsr_supported = Some(supported);
+        supported
+    }
+
+    /// Logs the MetalFX / VSR → FSR fallback once per renderer / upscaler change.
+    fn log_fallback(&mut self, reason: &dyn std::fmt::Display) {
+        if !self.fallback_logged {
+            self.fallback_logged = true;
+            let name = match self.upscaler {
+                Upscaler::Vsr => "Video super resolution",
+                _ => "MetalFX",
+            };
+            warn!(target: LOG_TARGET, "{name} requested but unavailable, using FSR 1.0: {reason}");
         }
     }
 
@@ -835,26 +871,67 @@ impl VideoRenderer {
         if let Some(old) = self.scaler.take() {
             self.retired_scalers.push(old);
         }
-        let metalfx_available = self.upscaler == Upscaler::MetalFx && self.metalfx_supported();
-        if self.upscaler == Upscaler::MetalFx && upscaled && !metalfx_available {
-            let reason = if metalfx::COMPILED {
-                "MTLFXSpatialScalerDescriptor.supportsDevice is false or wgpu is not on Metal"
-            } else {
-                "not compiled in (build with --features metalfx on macOS)"
-            };
-            self.log_metalfx_fallback(&reason);
+        // Dropped (it waits for its D3D11 work) before the next one is created: the
+        // NVIDIA driver super-resolves one video processor at a time, so a live old
+        // scaler would make the new one fail its driver check.
+        self.vsr = None;
+        let hardware_available = match self.upscaler {
+            Upscaler::MetalFx => self.metalfx_supported(),
+            Upscaler::Vsr => self.vsr_supported(),
+            _ => false,
+        };
+        if upscaled && !hardware_available {
+            match self.upscaler {
+                Upscaler::MetalFx => self.log_fallback(&if metalfx::COMPILED {
+                    "MTLFXSpatialScalerDescriptor.supportsDevice is false or wgpu is not on Metal"
+                } else {
+                    "not compiled in (build with --features metalfx on macOS)"
+                }),
+                Upscaler::Vsr => self.log_fallback(&if vsr::COMPILED {
+                    "wgpu is not on DX12, the adapter is not NVIDIA/Intel, or D3D11 video is unavailable"
+                } else {
+                    "not compiled in (build with --features vsr on Windows)"
+                }),
+                _ => {}
+            }
         }
-        let mut active = select_upscaler(self.upscaler, upscaled, metalfx_available);
-        let output = Target::new(
-            &self.device,
-            "video.output",
-            out_w,
-            out_h,
-            true,
-            active == Upscaler::MetalFx,
-        );
+        let mut active = select_upscaler(self.upscaler, upscaled, hardware_available);
         self.output_generation += 1;
-        if active == Upscaler::MetalFx {
+        if active == Upscaler::Vsr {
+            match VideoScaler::new(&self.device, (width, height), (out_w, out_h)) {
+                Ok((scaler, texture)) => {
+                    info!(target: LOG_TARGET, "{} video super resolution {}x{} → {}x{}", scaler.vendor_name(), width, height, out_w, out_h);
+                    self.vsr = Some(scaler);
+                    self.output = Some(Target::from_texture(
+                        texture,
+                        "video.output.vsr",
+                        out_w,
+                        out_h,
+                    ));
+                    self.rgb = None;
+                    self.easu_out = None;
+                    self.easu_bind_group = None;
+                    self.rcas_bind_group = None;
+                }
+                Err(e) => {
+                    self.log_fallback(&e);
+                    active = Upscaler::Fsr;
+                }
+            }
+        }
+        let output = if active == Upscaler::Vsr {
+            None
+        } else {
+            Some(Target::new(
+                &self.device,
+                "video.output",
+                out_w,
+                out_h,
+                true,
+                active == Upscaler::MetalFx,
+            ))
+        };
+        if let Some(output) = output.as_ref().filter(|_| active == Upscaler::MetalFx) {
             let rgb = Target::new(&self.device, "video.rgb", width, height, false, false);
             match SpatialScaler::new(
                 &self.device,
@@ -867,7 +944,7 @@ impl VideoRenderer {
                     // wgpu never sees MetalFX's writes, so its init tracker would zero the
                     // output before the first wgpu read (egui's sampling, a readback).
                     // One wgpu-side clear marks the texture initialised for good.
-                    self.mark_initialised(&output);
+                    self.mark_initialised(output);
                     self.scaler = Some(scaler);
                     self.rgb = Some(rgb);
                     self.easu_out = None;
@@ -875,12 +952,14 @@ impl VideoRenderer {
                     self.rcas_bind_group = None;
                 }
                 Err(e) => {
-                    self.log_metalfx_fallback(&e);
+                    self.log_fallback(&e);
                     active = Upscaler::Fsr;
                 }
             }
         }
-        self.output = Some(output);
+        if let Some(output) = output {
+            self.output = Some(output);
+        }
         self.active = active;
         if active == Upscaler::Fsr {
             let rgb = Target::new(&self.device, "video.rgb", width, height, false, false);
@@ -1004,6 +1083,37 @@ impl VideoRenderer {
         self.retire_finished();
         self.throttle_in_flight();
         self.ensure_targets(frame.width, frame.height)?;
+
+        // VSR uploads and converts on its own D3D11 device; `encoder` stays untouched and
+        // the wait for the blit rides on the caller's next submit. See vsr.rs.
+        if self.active == Upscaler::Vsr {
+            let result = match self.vsr.as_mut() {
+                Some(scaler) => scaler.process(&self.queue, frame),
+                None => Err(vsr::VsrError::NotCompiled),
+            };
+            match result {
+                Ok(()) => {
+                    self.last_zero_copy = false;
+                    self.pending_decoded_at = Some(frame.t_decoded);
+                    self.finish_prepare(t0);
+                    return self
+                        .output
+                        .as_ref()
+                        .map(|t| &t.sampled)
+                        .ok_or(Error::EmptyFrame {
+                            width: frame.width,
+                            height: frame.height,
+                        });
+                }
+                Err(e) => {
+                    // Render this frame with FSR instead of showing a stale output.
+                    warn!(target: LOG_TARGET, "Video super resolution failed, switching to FSR 1.0: {e}");
+                    self.vsr_supported = Some(false);
+                    self.source_size = (0, 0);
+                    self.ensure_targets(frame.width, frame.height)?;
+                }
+            }
+        }
 
         let imported = self.importer.import(&self.device, &self.queue, frame)?;
         self.last_zero_copy = imported.zero_copy;
@@ -1139,6 +1249,18 @@ impl VideoRenderer {
 
         self.pending.push(imported);
         self.pending_decoded_at = Some(frame.t_decoded);
+        self.finish_prepare(t0);
+        self.output
+            .as_ref()
+            .map(|t| &t.sampled)
+            .ok_or(Error::EmptyFrame {
+                width: frame.width,
+                height: frame.height,
+            })
+    }
+
+    /// Frame counter, worst `prepare` time and the periodic stats line.
+    fn finish_prepare(&mut self, t0: Instant) {
         self.frames_prepared += 1;
         self.max_prepare = self.max_prepare.max(t0.elapsed());
         if self.frames_prepared.is_multiple_of(300) {
@@ -1155,20 +1277,20 @@ impl VideoRenderer {
             );
             self.max_prepare = Duration::ZERO;
         }
-        self.output
-            .as_ref()
-            .map(|t| &t.sampled)
-            .ok_or(Error::EmptyFrame {
-                width: frame.width,
-                height: frame.height,
-            })
     }
 
     /// Tells the renderer that the encoder given to the last [`VideoRenderer::prepare`]
     /// call(s) has been submitted. Registers the completion callback that releases the
-    /// imported frame(s) and advances the timestamp readback.
+    /// imported frame(s) and advances the timestamp readback. With VSR it also signals
+    /// the shared fence behind that submit, so the next blit waits for egui's read.
     pub fn after_submit(&mut self) {
-        if !self.pending.is_empty() || !self.retired_scalers.is_empty() {
+        if let Some(scaler) = self.vsr.as_mut() {
+            scaler.after_submit(&self.queue);
+        }
+        if !self.pending.is_empty()
+            || !self.retired_scalers.is_empty()
+            || self.pending_decoded_at.is_some()
+        {
             let frames = std::mem::take(&mut self.pending);
             let scalers = std::mem::take(&mut self.retired_scalers);
             let done = Arc::new(AtomicBool::new(false));
@@ -1252,16 +1374,37 @@ impl VideoRenderer {
         self.scaler.as_ref()
     }
 
+    /// The video super resolution scaler in use, if [`Upscaler::Vsr`] is active.
+    pub fn vsr_scaler(&self) -> Option<&VideoScaler> {
+        self.vsr.as_ref()
+    }
+
+    /// Drops the video super resolution scaler (waiting briefly for its D3D11 work) so
+    /// another one can take the driver's single super resolution slot. Call it on a
+    /// renderer that is being replaced; this one switches to FSR on its next frame.
+    /// The output texture stays valid for anything still sampling it.
+    pub fn release_vsr(&mut self) {
+        if self.vsr.take().is_some() && self.active == Upscaler::Vsr {
+            // Rebuild on the next `ensure_targets` instead of showing a frozen output.
+            self.source_size = (0, 0);
+        }
+    }
+
     /// Bumps every time the output texture is recreated; UIs re-register the view then.
     pub fn output_generation(&self) -> u64 {
         self.output_generation
     }
 
-    /// Latest resolved GPU timings, `None` without `TIMESTAMP_QUERY` or before the first
-    /// readback completed. With MetalFX active, `metalfx_ms` is the last completed
+    /// Latest resolved GPU timings, `None` without `TIMESTAMP_QUERY`, before the first
+    /// readback completed, or while [`Upscaler::Vsr`] runs. With MetalFX active, `metalfx_ms` is the last completed
     /// command-buffer time of the scaler (and the only field available without
     /// `TIMESTAMP_QUERY`).
     pub fn gpu_timings(&self) -> Option<GpuTimings> {
+        // No wgpu pass runs with VSR, so the timestamp readback would be stale, and the
+        // driver's work cannot be timed (see vsr.rs); the present latency covers it.
+        if self.active == Upscaler::Vsr {
+            return None;
+        }
         let metalfx_ms = self.scaler.as_ref().and_then(SpatialScaler::last_gpu_ms);
         match (self.timing.as_ref().and_then(|t| t.latest), metalfx_ms) {
             (Some(mut t), m) => {
@@ -1886,6 +2029,119 @@ mod tests {
         renderer.after_submit();
         assert_eq!(renderer.in_flight(), 0);
         assert_eq!(renderer.stalls(), 0);
+    }
+
+    /// A DX12 device (the only backend VSR shares textures with).
+    #[cfg(all(windows, feature = "vsr"))]
+    fn dx12_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::DX12;
+        let instance = wgpu::Instance::new(desc);
+        let adapter =
+            block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    #[cfg(all(windows, feature = "vsr"))]
+    #[test]
+    fn vsr_upscale_keeps_flat_colour_and_survives_resize() {
+        let Some((device, queue)) = dx12_gpu() else {
+            eprintln!("no DX12 adapter; skipping");
+            return;
+        };
+        if !vsr::supported(&device) {
+            eprintln!("no NVIDIA/Intel D3D11 video device; skipping");
+            return;
+        }
+        let policy = UpscalePolicy {
+            enabled: true,
+            max_width: 1920,
+            max_height: 1080,
+        };
+        let mut renderer = VideoRenderer::with_upscaler(&device, &queue, policy, Upscaler::Vsr);
+        let color = ColorInfo::default();
+        let want = reference_rgb(0x80, 0x70, 0x90, &color);
+        // The AI model shifts flat colour by a few levels (up to 7 measured on RTX 40).
+        let check = |pixels: &[[u8; 4]], what: &str| {
+            for (i, px) in pixels.iter().enumerate() {
+                for c in 0..3 {
+                    assert!(
+                        (i32::from(px[c]) - i32::from(want[c])).abs() <= 8,
+                        "{what} pixel {i} channel {c}: got {px:?} want {want:?}"
+                    );
+                }
+                assert_eq!(px[3], 255, "{what} pixel {i} alpha");
+            }
+        };
+        let frame = cpu_frame(960, 540, |_, _| 0x80, 0x70, 0x90, color);
+        let (pixels, w, h) = render_and_read(&mut renderer, &device, &queue, &frame);
+        assert_eq!((w, h), (1920, 1080));
+        check(&pixels, "first");
+        if renderer.active_upscaler() == Upscaler::Fsr {
+            // Super resolution is off in the driver settings (or another process holds the
+            // driver's slot): the driver check must have caught it.
+            assert!(matches!(
+                VideoScaler::new(&device, (960, 540), (1920, 1080)),
+                Err(vsr::VsrError::DriverInactive { .. })
+            ));
+            assert_eq!(renderer.upscaler_label(), "FSR");
+            eprintln!("driver super resolution is off; checked the FSR fallback only");
+            return;
+        }
+        assert_eq!(renderer.active_upscaler(), Upscaler::Vsr);
+        assert_eq!(renderer.upscaler_label(), "VSR");
+        assert_eq!(renderer.gpu_timings(), None, "driver work cannot be timed");
+        let scaler = renderer.vsr_scaler().expect("scaler");
+        assert_eq!(scaler.input_size(), (960, 540));
+        assert_eq!(scaler.frames(), 1);
+        // Odd size and resize: new scaler, NV12 padding cropped.
+        let frame2 = cpu_frame(641, 361, |_, _| 0x80, 0x70, 0x90, color);
+        let generation = renderer.output_generation();
+        let (pixels2, w2, h2) = render_and_read(&mut renderer, &device, &queue, &frame2);
+        assert_eq!((w2, h2), (1917, 1080));
+        assert!(renderer.output_generation() > generation);
+        assert_eq!(
+            renderer.vsr_scaler().expect("scaler").input_size(),
+            (641, 361)
+        );
+        check(&pixels2, "resized");
+
+        // Two frames prepared before one submit (the second encoder's wait covers both).
+        let mut first = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        renderer.prepare(&mut first, &frame2).expect("prepare 1");
+        let mut second = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        renderer.prepare(&mut second, &frame2).expect("prepare 2");
+        queue.submit([first.finish(), second.finish()]);
+        renderer.after_submit();
+        // A skipped paint: prepared, never submitted, `after_submit` still called.
+        let mut dropped = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        renderer.prepare(&mut dropped, &frame2).expect("prepare 3");
+        drop(dropped);
+        renderer.after_submit();
+        // Neither may deadlock the queues; steady state keeps the picture intact.
+        for _ in 0..6 {
+            let (pixels, _, _) = render_and_read(&mut renderer, &device, &queue, &frame2);
+            check(&pixels, "steady");
+        }
+        assert_eq!(renderer.vsr_scaler().expect("scaler").frames(), 10);
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        renderer.after_submit();
+        assert_eq!(renderer.in_flight(), 0);
+        assert_eq!(renderer.stalls(), 0);
+
+        // The driver super-resolves one processor at a time: a replacement renderer only
+        // gets VSR once the old one released its scaler (what the app's `retire` does).
+        let mut replacement = VideoRenderer::with_upscaler(&device, &queue, policy, Upscaler::Vsr);
+        replacement.ensure_targets(960, 540).expect("targets");
+        assert_eq!(replacement.active_upscaler(), Upscaler::Fsr, "slot taken");
+        renderer.release_vsr();
+        assert!(renderer.vsr_scaler().is_none());
+        replacement.set_upscaler(Upscaler::Fsr);
+        replacement.set_upscaler(Upscaler::Vsr);
+        replacement.ensure_targets(960, 540).expect("targets");
+        assert_eq!(replacement.active_upscaler(), Upscaler::Vsr, "slot freed");
     }
 
     #[cfg(all(target_os = "macos", feature = "metalfx"))]

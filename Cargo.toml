@@ -68,7 +68,9 @@ open = "5"
 
 # media
 h264-reader = "0.9"
-ffmpeg-next = "9"
+# Decoder (avcodec) and swscale; ffmpeg-next's codec module also needs `format`. The
+# unused filter, device and resampling libraries stay out of the Windows and macOS bundles.
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
 opus = "0.4"
 cpal = "0.18"
 
@@ -83,6 +85,9 @@ objc2-video-toolbox = "0.3"
 objc2-metal = "0.3"
 objc2-metal-fx = "0.3"
 objc2-game-controller = "0.3"
+# windows (same major as wgpu-hal's DX12 backend, so its D3D12 types are ours)
+windows = "0.62"
+winresource = "0.1"
 
 # input
 gilrs = "0.11"
