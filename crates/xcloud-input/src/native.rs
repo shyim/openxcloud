@@ -283,18 +283,18 @@ mod gilrs_backend {
             let Some(pad) = active.and_then(|id| gilrs.connected_gamepad(id)) else {
                 return NativeGamepadSample::default();
             };
+            let state = map_gamepad(&pad);
             // Sony pads go through GameController on macOS (see `super::sony_gc`); the
             // gilrs state is the fallback while GameController has not listed the pad.
             #[cfg(target_os = "macos")]
-            let framework_state = (pad.vendor_id() == Some(super::sony_gc::SONY_VENDOR_ID))
+            let state = (pad.vendor_id() == Some(super::sony_gc::SONY_VENDOR_ID))
                 .then(super::sony_gc::sample)
-                .flatten();
-            #[cfg(not(target_os = "macos"))]
-            let framework_state = None;
+                .flatten()
+                .unwrap_or(state);
             NativeGamepadSample {
                 connected: true,
                 name: controller_name(&pad),
-                state: framework_state.unwrap_or_else(|| map_gamepad(&pad)),
+                state,
             }
         }
 
