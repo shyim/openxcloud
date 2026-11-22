@@ -151,7 +151,11 @@ impl SettingsSheet {
             .show(ctx, |ui| {
                 ui.set_min_size(screen.size());
                 // Scrim; a click outside the sheet closes it.
-                let scrim = ui.interact(screen, Id::unique("settings_scrim"), Sense::click());
+                // Keyboard and controller focus stays inside the sheet.
+                ui.ctx().memory_mut(|m| m.set_modal_layer(ui.layer_id()));
+                // Neither the scrim nor the sheet background takes focus: activating a
+                // focused scrim would close the sheet.
+                let scrim = ui.interact(screen, Id::unique("settings_scrim"), Sense::CLICK);
                 ui.painter().rect_filled(screen, 0.0, theme::SCRIM);
                 let w = (screen.width() - 80.0).min(1180.0);
                 let h = (screen.height() - 64.0).min(860.0);
@@ -165,7 +169,7 @@ impl SettingsSheet {
                     out.close = true;
                 }
                 // Swallow clicks on the sheet so they never reach the scrim.
-                ui.interact(sheet, Id::unique("settings_sheet_bg"), Sense::click());
+                ui.interact(sheet, Id::unique("settings_sheet_bg"), Sense::CLICK);
                 self.sheet(
                     ui,
                     sheet,
@@ -393,6 +397,7 @@ fn streaming(ui: &mut Ui, s: &mut AppSettings, streaming_available: bool) -> boo
                 .desired_width(200.0)
                 .margin(egui::Margin::symmetric(12, 8));
             let response = ui.add(edit);
+            crate::ui::focus_nav::register(ui, &response);
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::Role::TextInput, true, LABEL_REGION)
             });
@@ -438,9 +443,11 @@ fn video(ui: &mut Ui, s: &mut AppSettings) -> bool {
                         for (height, label) in
                             [(1080, "1080p"), (1440, "1440p"), (2160, "4K (2160p)")]
                         {
-                            ui.selectable_value(&mut s.upscale_height, height, label);
+                            let item = ui.selectable_value(&mut s.upscale_height, height, label);
+                            crate::ui::focus_nav::register(ui, &item);
                         }
                     });
+                crate::ui::focus_nav::register(ui, &response.response);
                 response.response.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Output resolution")
                 });
@@ -860,6 +867,7 @@ fn language(ui: &mut Ui, s: &mut AppSettings, filter: &mut String) -> bool {
         .desired_width(ui.available_width().min(360.0))
         .margin(egui::Margin::symmetric(12, 9));
     let response = ui.add(edit);
+    crate::ui::focus_nav::register(ui, &response);
     let value = filter.clone();
     response.widget_info(|| {
         let mut info =
@@ -906,6 +914,7 @@ fn locale_row(
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, info.native)
     });
+    crate::ui::focus_nav::register(ui, &response);
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -1069,6 +1078,19 @@ pub fn slider(
     let (rect, response) =
         ui.allocate_exact_size(vec2(track_w + readout_w, 30.0), Sense::click_and_drag());
     response.widget_info(|| egui::WidgetInfo::slider(true, f64::from(*value), label));
+    crate::ui::focus_nav::register_adjustable(ui, &response);
+    if response.has_focus() {
+        // Left and right adjust the value instead of moving focus away.
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            );
+        });
+    }
     if response.hovered() || response.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }

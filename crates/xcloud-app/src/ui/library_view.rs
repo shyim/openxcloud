@@ -753,6 +753,7 @@ impl LibraryView {
                     info.current_text_value = Some(value.clone());
                     info
                 });
+                crate::ui::focus_nav::register(ui, &response);
                 if self.focus_search {
                     response.request_focus();
                     self.focus_search = false;
@@ -2176,6 +2177,7 @@ fn detail_rows(card: &LibraryCard) -> Vec<(&'static str, String)> {
 fn avatar_button(ui: &mut Ui, size: f32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, ACCOUNT_LABEL));
+    crate::ui::focus_nav::register(ui, &response);
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -2205,6 +2207,7 @@ fn avatar_button(ui: &mut Ui, size: f32) -> egui::Response {
 fn menu_item(ui: &mut Ui, icon: Icon, text: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::MenuItem, true, text));
+    crate::ui::focus_nav::register(ui, &response);
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(8), theme::SURFACE_HIGHER);
@@ -2230,6 +2233,7 @@ fn check_item(ui: &mut Ui, text: &str, checked: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
     response
         .widget_info(|| egui::WidgetInfo::selected(egui::Role::MenuItemRadio, true, checked, text));
+    crate::ui::focus_nav::register(ui, &response);
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(8), theme::SURFACE_HIGHER);
@@ -2273,6 +2277,7 @@ fn chip(ui: &mut Ui, text: &str, selected: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(w.max(48.0), 32.0), Sense::click());
     response
         .widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, true, selected, text));
+    crate::ui::focus_nav::register(ui, &response);
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -2292,6 +2297,7 @@ fn chip(ui: &mut Ui, text: &str, selected: bool) -> egui::Response {
 fn see_all_row(ui: &mut Ui, text: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, text));
+    crate::ui::focus_nav::register(ui, &response);
     let t = kit::hover_t(ui, response.id, response.hovered());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2317,6 +2323,7 @@ fn compact_thumb(ui: &mut Ui, card: &LibraryCard, artwork: &dyn ArtworkSource) -
     let (row, response) = ui.allocate_exact_size(vec2(ui.available_width(), 60.0), Sense::click());
     response
         .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, card.name.as_str()));
+    crate::ui::focus_nav::register(ui, &response);
     let thumb = Rect::from_center_size(row.center(), vec2(48.0, 48.0));
     ui.painter()
         .rect_filled(thumb, CornerRadius::same(8), theme::SURFACE_HIGH);
@@ -2460,6 +2467,91 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, LibraryCommand::Refresh { .. }))
         );
+    }
+
+    #[test]
+    fn controller_focus_walks_the_home_page() {
+        use crate::ui::focus_nav::{self, Direction};
+        let f = fixture();
+        let mut view = LibraryView::new();
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .with_context_setup(theme::apply)
+            .with_max_steps(24)
+            .allow_missing_glyphs()
+            .build_ui(move |ui| {
+                let _ = view.show(ui, &f.library, &f.session, &NoArtwork);
+                focus_nav::end_frame(ui.ctx());
+            });
+        h.run_steps(3);
+        let mut step = |direction: Direction| {
+            focus_nav::move_focus(&h.ctx, direction);
+            h.run_steps(6);
+            let id = h.ctx.memory(|m| m.focused()).expect("a widget is focused");
+            let rect = h.ctx.read_response(id).expect("it is laid out").rect;
+            (id, rect)
+        };
+        // The first press lands on the first game, not on the window chrome.
+        let (alpha, alpha_rect) = step(Direction::Down);
+        let (charlie, charlie_rect) = step(Direction::Right);
+        assert_ne!(alpha, charlie);
+        assert!(
+            charlie_rect.left() > alpha_rect.right(),
+            "one tile to the right"
+        );
+        assert_eq!(charlie_rect.top(), alpha_rect.top(), "in the same row");
+        // Down leaves the row for the next section and the page follows the focus.
+        let (below, below_rect) = step(Direction::Down);
+        assert_ne!(below, charlie);
+        assert!(
+            (below_rect.center().y - 450.0).abs() < 150.0,
+            "the focused card is scrolled towards the middle, at {below_rect:?}"
+        );
+        // Left keeps going into the sidebar; Right comes back to the page.
+        step(Direction::Left);
+        let (sidebar, sidebar_rect) = step(Direction::Left);
+        assert!(
+            sidebar_rect.right() < 340.0,
+            "in the sidebar, at {sidebar_rect:?}"
+        );
+        let (back, _) = step(Direction::Right);
+        assert_ne!(back, sidebar);
+    }
+
+    /// Like the shell's guard: every focusable widget of the library pages is a
+    /// controller target. The play and favourite buttons inside a tile are left out on
+    /// purpose; the controller opens the game page instead.
+    #[test]
+    fn library_pages_are_reachable_by_controller() {
+        use crate::ui::focus_nav;
+        let game = Route::Game(Box::new(snapshot().all_items[0].clone()));
+        for route in [Route::Page(Page::Home), Route::Page(Page::Library), game] {
+            let f = fixture();
+            let mut view = LibraryView::new();
+            view.go(route.clone(), &f.library, false);
+            let mut h = Harness::builder()
+                .with_size(egui::vec2(1400.0, 900.0))
+                .with_context_setup(theme::apply)
+                .with_max_steps(24)
+                .allow_missing_glyphs()
+                .build_ui(|ui| {
+                    let _ = view.show(ui, &f.library, &f.session, &NoArtwork);
+                    focus_nav::end_frame(ui.ctx());
+                });
+            h.run_steps(3);
+            let missing: Vec<String> = focus_nav::unreachable_by_controller(&h)
+                .into_iter()
+                .filter(|node| {
+                    !["label: \"Play ", "label: \"Add ", "label: \"Remove "]
+                        .iter()
+                        .any(|nested| node.contains(nested))
+                })
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{route:?}: not registered: {missing:#?}"
+            );
+        }
     }
 
     #[test]
