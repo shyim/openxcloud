@@ -137,6 +137,10 @@ pub struct App {
     settings_store: SettingsStore,
     settings_open: bool,
     settings_sheet: SettingsSheet,
+    /// The controller polled for the settings sheet's controller test; only alive while
+    /// that test is on screen.
+    #[cfg(not(target_os = "ios"))]
+    gamepad_tester: Option<xcloud_input::native::NativeGamepad>,
     /// Keeps macOS from opening Games/Arcade on the controller Home button mid-stream.
     system_gestures: xcloud_input::system_gestures::SystemGestureGuard,
     /// `streamLoader.active` in the previous frame, to notice the view going away.
@@ -296,6 +300,8 @@ impl App {
             settings_store: store,
             settings_open: false,
             settings_sheet: SettingsSheet::new(),
+            #[cfg(not(target_os = "ios"))]
+            gamepad_tester: None,
             system_gestures: xcloud_input::system_gestures::SystemGestureGuard::new(),
             stream_was_active: false,
             save_error_logged: false,
@@ -526,7 +532,26 @@ impl App {
         if self.settings_open {
             self.settings_window(&ctx);
         }
+        self.poll_gamepad_tester(&ctx);
     }
+
+    /// Feeds the sheet's controller test for the next frame and keeps repainting while
+    /// it is visible, so the view follows the controller without other input.
+    #[cfg(not(target_os = "ios"))]
+    fn poll_gamepad_tester(&mut self, ctx: &egui::Context) {
+        if !(self.settings_open && self.settings_sheet.wants_gamepad()) {
+            self.gamepad_tester = None;
+            return;
+        }
+        let pad = self
+            .gamepad_tester
+            .get_or_insert_with(xcloud_input::native::NativeGamepad::new);
+        self.settings_sheet.set_gamepad(pad.sample());
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
+    #[cfg(target_os = "ios")]
+    fn poll_gamepad_tester(&mut self, _ctx: &egui::Context) {}
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut draft = self.controllers.settings.read().clone();

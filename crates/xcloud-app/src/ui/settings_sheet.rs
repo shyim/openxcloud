@@ -18,12 +18,16 @@ use crate::state::AppSettings;
 use crate::theme::{self, Weight, font_w};
 use crate::ui::icons::{self, Icon};
 use crate::ui::kit::{self, Button, Tone};
+use xcloud_input::source::NativeGamepadSample;
+use xcloud_proto::input::models::GamepadButtons;
 
 /// Accessible label of the close button.
 pub const CLOSE_LABEL: &str = "Close settings";
 pub const LABEL_HUD: &str = "Performance overlay";
 pub const LABEL_SIGN_OUT: &str = "Sign out";
 pub const LABEL_REFRESH: &str = "Refresh library";
+/// Status line of the controller test when nothing is connected.
+pub const TESTER_NO_CONTROLLER: &str = "No controller detected. Connect one and press a button.";
 
 /// The sheet's categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -100,6 +104,8 @@ pub struct SettingsSheet {
     category: Category,
     /// Search text of the language list.
     language_filter: String,
+    /// The latest poll of the physical controller, shown by the controller test.
+    gamepad: NativeGamepadSample,
 }
 
 impl SettingsSheet {
@@ -113,6 +119,17 @@ impl SettingsSheet {
 
     pub fn set_category(&mut self, category: Category) {
         self.category = category;
+    }
+
+    /// Whether the visible category shows the controller test, i.e. the host should
+    /// poll the controller and hand the result to [`Self::set_gamepad`] every frame.
+    pub fn wants_gamepad(&self) -> bool {
+        self.category == Category::Controller
+    }
+
+    /// The controller state the test displays.
+    pub fn set_gamepad(&mut self, sample: NativeGamepadSample) {
+        self.gamepad = sample;
     }
 
     /// Paints the sheet over the whole window.
@@ -287,7 +304,9 @@ impl SettingsSheet {
                             out.changed |= streaming(ui, settings, streaming_available)
                         }
                         Category::Video => out.changed |= video(ui, settings),
-                        Category::Controller => out.changed |= controller(ui, settings),
+                        Category::Controller => {
+                            out.changed |= controller(ui, settings, &self.gamepad)
+                        }
                         Category::Language => {
                             out.changed |= language(ui, settings, &mut self.language_filter)
                         }
@@ -506,8 +525,217 @@ fn video(ui: &mut Ui, s: &mut AppSettings) -> bool {
     changed
 }
 
-fn controller(ui: &mut Ui, s: &mut AppSettings) -> bool {
+/// Live view of the physical controller, drawn as a controller: sticks, triggers and
+/// buttons light up as the app reads them, before the settings below (swap, invert,
+/// deadzone) are applied. The deadzone is drawn as a ring inside each stick.
+fn controller_test(ui: &mut Ui, sample: &NativeGamepadSample, deadzone: f32) {
+    heading(ui, "Test", "");
+    let (status, color) = if sample.connected {
+        (format!("{} connected", sample.name), theme::SUCCESS)
+    } else {
+        (TESTER_NO_CONTROLLER.to_owned(), theme::TEXT_SECONDARY)
+    };
+    ui.label(RichText::new(status).font(theme::font(14.0)).color(color));
+    ui.add_space(4.0);
+
+    let state = &sample.state;
+    let live = sample.connected;
+    let (panel, _) = ui.allocate_exact_size(vec2(ui.available_width(), 300.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(panel, CornerRadius::same(12), theme::SURFACE);
+
+    // The drawing is laid out in controller units around the body centre: x right,
+    // y down, the body about 400 wide. The whole figure spans y -146..132.
+    const SCALE: f32 = 0.95;
+    let origin = panel.center() + vec2(0.0, 7.0 * SCALE);
+    let at = |x: f32, y: f32| origin + vec2(x, y) * SCALE;
+    let rect =
+        |x: f32, y: f32, w: f32, h: f32| Rect::from_center_size(at(x, y), vec2(w, h) * SCALE);
+    let round = |r: f32| CornerRadius::same((r * SCALE) as u8);
+    let dim = |c: Color32| if live { c } else { c.gamma_multiply(0.45) };
+    let pressed = |bit: GamepadButtons| live && state.buttons.contains(bit);
+    let body = theme::SURFACE_HIGH;
+    let well = theme::SURFACE_HIGHER;
+    let lit = |on: bool| if on { theme::ACCENT } else { well };
+    let small = font_w(11.0, Weight::Semibold);
+
+    for side in [-1.0_f32, 1.0] {
+        let left = side < 0.0;
+        let (name, trigger, thumb, bumper) = if left {
+            (
+                "L",
+                state.left_trigger,
+                state.left_thumb,
+                GamepadButtons::LEFT_SHOULDER,
+            )
+        } else {
+            (
+                "R",
+                state.right_trigger,
+                state.right_thumb,
+                GamepadButtons::RIGHT_SHOULDER,
+            )
+        };
+        let trigger = if live { trigger.clamp(0.0, 1.0) } else { 0.0 };
+
+        // Trigger: fills from the bottom with the pull, percentage beside it.
+        let slot = rect(side * 112.0, -130.0, 46.0, 32.0);
+        painter.rect_filled(slot, round(9.0), well);
+        let mut fill = slot;
+        fill.set_top(slot.bottom() - slot.height() * trigger);
+        painter.rect_filled(fill, round(9.0), theme::ACCENT);
+        painter.text(
+            slot.center(),
+            Align2::CENTER_CENTER,
+            format!("{name}T"),
+            small.clone(),
+            if trigger > 0.5 {
+                theme::ON_ACCENT
+            } else {
+                dim(theme::TEXT_SECONDARY)
+            },
+        );
+        painter.text(
+            at(side * 145.0, -130.0),
+            if left {
+                Align2::RIGHT_CENTER
+            } else {
+                Align2::LEFT_CENTER
+            },
+            format!("{:.0}%", trigger * 100.0),
+            theme::font(12.0),
+            dim(theme::TEXT_SECONDARY),
+        );
+
+        // Bumper: peeks out from behind the body.
+        painter.rect_filled(
+            rect(side * 112.0, -95.0, 100.0, 30.0),
+            round(13.0),
+            lit(pressed(bumper)),
+        );
+
+        // Grip.
+        let (top, bottom) = (at(side * 135.0, -20.0), at(side * 157.0, 90.0));
+        painter.line_segment([top, bottom], Stroke::new(84.0 * SCALE, body));
+        painter.circle_filled(bottom, 42.0 * SCALE, body);
+
+        // Stick readout under the panel corner.
+        painter.text(
+            pos2(
+                if left {
+                    panel.left() + 18.0
+                } else {
+                    panel.right() - 18.0
+                },
+                panel.bottom() - 18.0,
+            ),
+            if left {
+                Align2::LEFT_CENTER
+            } else {
+                Align2::RIGHT_CENTER
+            },
+            format!("{name}  {:+.2}  {:+.2}", thumb.x, thumb.y),
+            theme::font(12.0),
+            dim(theme::TEXT_SECONDARY),
+        );
+    }
+    painter.rect_filled(rect(0.0, -12.5, 360.0, 165.0), round(56.0), body);
+
+    // Sticks (left one high, right one low, Xbox style). Raw sticks are up-positive;
+    // the screen is down-positive.
+    for (x, y, thumb, click) in [
+        (-105.0, -40.0, state.left_thumb, GamepadButtons::LEFT_THUMB),
+        (55.0, 25.0, state.right_thumb, GamepadButtons::RIGHT_THUMB),
+    ] {
+        let (center, travel) = (at(x, y), 22.0 * SCALE);
+        painter.circle_filled(center, 32.0 * SCALE, well);
+        if pressed(click) {
+            painter.circle_stroke(center, 32.0 * SCALE, Stroke::new(2.0, theme::ACCENT));
+        }
+        if deadzone > 0.0 {
+            painter.circle_stroke(
+                center,
+                travel * deadzone,
+                Stroke::new(1.0, theme::TEXT_TERTIARY),
+            );
+        }
+        let offset = if live {
+            vec2(thumb.x.clamp(-1.0, 1.0), -thumb.y.clamp(-1.0, 1.0)) * travel
+        } else {
+            vec2(0.0, 0.0)
+        };
+        let moved = offset.length() > travel * deadzone.max(0.02);
+        painter.circle_filled(
+            center + offset,
+            9.0 * SCALE,
+            dim(if moved || pressed(click) {
+                theme::ACCENT
+            } else {
+                theme::TEXT_PRIMARY
+            }),
+        );
+    }
+
+    // D-pad: a cross whose arms light up.
+    let (dx, dy) = (-55.0, 25.0);
+    painter.rect_filled(rect(dx, dy, 20.0, 20.0), round(0.0), well);
+    for (ox, oy, bit) in [
+        (0.0, -18.0, GamepadButtons::DPAD_UP),
+        (0.0, 18.0, GamepadButtons::DPAD_DOWN),
+        (-18.0, 0.0, GamepadButtons::DPAD_LEFT),
+        (18.0, 0.0, GamepadButtons::DPAD_RIGHT),
+    ] {
+        painter.rect_filled(
+            rect(dx + ox, dy + oy, 20.0, 20.0),
+            round(5.0),
+            lit(pressed(bit)),
+        );
+    }
+
+    // Face buttons.
+    for (ox, oy, name, bit) in [
+        (0.0, 21.0, "A", GamepadButtons::A),
+        (21.0, 0.0, "B", GamepadButtons::B),
+        (-21.0, 0.0, "X", GamepadButtons::X),
+        (0.0, -21.0, "Y", GamepadButtons::Y),
+    ] {
+        let center = at(105.0 + ox, -40.0 + oy);
+        let on = pressed(bit);
+        painter.circle_filled(center, 12.0 * SCALE, lit(on));
+        painter.text(
+            center,
+            Align2::CENTER_CENTER,
+            name,
+            small.clone(),
+            if on {
+                theme::ON_ACCENT
+            } else {
+                dim(theme::TEXT_SECONDARY)
+            },
+        );
+    }
+
+    // View, Xbox and Menu.
+    painter.circle_filled(
+        at(-28.0, -40.0),
+        7.0 * SCALE,
+        lit(pressed(GamepadButtons::VIEW)),
+    );
+    painter.circle_filled(
+        at(28.0, -40.0),
+        7.0 * SCALE,
+        lit(pressed(GamepadButtons::MENU)),
+    );
+    painter.circle_filled(
+        at(0.0, -68.0),
+        12.0 * SCALE,
+        lit(pressed(GamepadButtons::NEXUS)),
+    );
+}
+
+fn controller(ui: &mut Ui, s: &mut AppSettings, gamepad: &NativeGamepadSample) -> bool {
     let mut changed = false;
+    controller_test(ui, gamepad, s.deadzone as f32);
     heading(ui, "Buttons", "");
     changed |= kit::setting_row(ui, LABEL_SWAP_AB, "Swap the A and B buttons", |ui| {
         kit::toggle(ui, &mut s.swap_ab, LABEL_SWAP_AB).changed()
@@ -907,6 +1135,7 @@ mod tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
+    use xcloud_proto::input::gamepad::RawGamepadState;
 
     fn harness<'a>(
         sheet: &'a mut SettingsSheet,
@@ -985,6 +1214,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn controller_test_shows_the_connection_and_pressed_buttons() {
+        let mut state = RawGamepadState::default();
+        state.buttons.insert(GamepadButtons::A);
+        state.buttons.insert(GamepadButtons::DPAD_LEFT);
+        state.buttons.insert(GamepadButtons::LEFT_SHOULDER);
+        state.left_thumb = xcloud_proto::input::models::Vec2::new(0.6, 0.5);
+        state.right_trigger = 0.7;
+        let mut sheet = SettingsSheet::new();
+        sheet.set_category(Category::Controller);
+        assert!(sheet.wants_gamepad());
+        let mut settings = AppSettings::default();
+        let mut outputs = Vec::new();
+        {
+            let mut h = harness(&mut sheet, &mut settings, &mut outputs);
+            h.run_steps(2);
+            assert!(h.query_by_label(TESTER_NO_CONTROLLER).is_some());
+        }
+        sheet.set_gamepad(NativeGamepadSample {
+            connected: true,
+            name: "Test Pad".into(),
+            state,
+        });
+        let mut h = harness(&mut sheet, &mut settings, &mut outputs);
+        h.run_steps(2);
+        assert!(h.query_by_label("Test Pad connected").is_some());
     }
 
     #[test]
