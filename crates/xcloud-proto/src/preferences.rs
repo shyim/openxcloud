@@ -65,14 +65,12 @@ pub fn stream_resolution_to_string(mode: StreamResolutionMode) -> &'static str {
     }
 }
 
-/// `streamResolutionOsName`: spoofed OS name that selects the quality tier for a resolution.
-pub fn stream_resolution_os_name(mode: StreamResolutionMode) -> &'static str {
-    match mode {
-        StreamResolutionMode::Auto | StreamResolutionMode::P720 => "android",
-        StreamResolutionMode::P1080 | StreamResolutionMode::P1440 => "windows",
-        StreamResolutionMode::P1080HQ => "tizen",
-    }
-}
+/// Spoofed client OS name sent by default: the client presents itself as Edge on an Xbox One.
+pub const DEFAULT_OS_NAME: &str = "xbox";
+
+/// User-Agent of Microsoft Edge on Xbox One, used wherever the client sends a browser UA.
+pub const XBOX_ONE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; Xbox; Xbox One) \
+     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0";
 
 /// `streamResolutionDisplayWidth`: advertised display width in pixels.
 pub fn stream_resolution_display_width(mode: StreamResolutionMode) -> u32 {
@@ -94,13 +92,14 @@ pub fn stream_resolution_display_height(mode: StreamResolutionMode) -> u32 {
     }
 }
 
-/// `normalizedOsNameOverride`: accepts only the three known OS names, case-insensitively.
-/// Returns `None` for anything else so the caller derives the name from the resolution.
+/// `normalizedOsNameOverride`: accepts only the known OS names, case-insensitively.
+/// Returns `None` for anything else so the caller falls back to [`DEFAULT_OS_NAME`].
 pub fn normalized_os_name_override(raw: &str) -> Option<&'static str> {
     match raw.trim().to_lowercase().as_str() {
         "android" => Some("android"),
         "windows" => Some("windows"),
         "tizen" => Some("tizen"),
+        "xbox" => Some("xbox"),
         _ => None,
     }
 }
@@ -117,7 +116,7 @@ pub struct StreamPreferences {
     pub preferred_region_id: String,
     #[serde(rename = "fallbackRegionNames")]
     pub fallback_region_names: Vec<String>,
-    /// Explicit client osName override ("android", "windows", "tizen"); empty derives from resolution.
+    /// Explicit client osName override ("android", "windows", "tizen", "xbox"); empty uses "xbox".
     #[serde(rename = "osNameOverride")]
     pub os_name_override: String,
 }
@@ -138,13 +137,12 @@ impl Default for StreamPreferences {
 impl StreamPreferences {
     /// Resolved OS name after normalising the override.
     pub fn effective_os_name(&self) -> &'static str {
-        normalized_os_name_override(&self.os_name_override)
-            .unwrap_or_else(|| stream_resolution_os_name(self.resolution))
+        normalized_os_name_override(&self.os_name_override).unwrap_or(DEFAULT_OS_NAME)
     }
 }
 
 /// `makeDeviceInfo`: the `X-MS-Device-Info` payload that advertises the spoofed
-/// browser profile. This header is what makes the service return 1080p instead
+/// device profile (Microsoft Edge on an Xbox One). This header is what makes the service return 1080p instead
 /// of 720p, so the shape must match the reference clients exactly (the string
 /// is built by hand to keep key order and formatting byte-identical).
 ///
@@ -154,18 +152,17 @@ pub fn make_device_info(
     resolution: StreamResolutionMode,
     os_name_override: &str,
 ) -> String {
-    let os_name = normalized_os_name_override(os_name_override)
-        .unwrap_or_else(|| stream_resolution_os_name(resolution));
+    let os_name = normalized_os_name_override(os_name_override).unwrap_or(DEFAULT_OS_NAME);
     let width = stream_resolution_display_width(resolution);
     let height = stream_resolution_display_height(resolution);
 
     format!(
         "{{\"appInfo\":{{\"env\":{{\"clientAppId\":\"www.xbox.com\",\"clientAppType\":\"browser\",\
          \"clientAppVersion\":\"21.1.98\",\"clientSdkVersion\":\"8.5.3\",\"httpEnvironment\":\"prod\",\
-         \"sdkInstallId\":\"\"}}}},\"dev\":{{\"hw\":{{\"make\":\"Microsoft\",\"model\":\"unknown\",\
-         \"sdktype\":\"web\"}},\"os\":{{\"name\":\"{os_name}\",\"ver\":\"22631.2715\",\"platform\":\"desktop\"}},\
+         \"sdkInstallId\":\"\"}}}},\"dev\":{{\"hw\":{{\"make\":\"Microsoft\",\"model\":\"Xbox One\",\
+         \"sdktype\":\"web\"}},\"os\":{{\"name\":\"{os_name}\",\"ver\":\"10.0.25398.4909\",\"platform\":\"console\"}},\
          \"displayInfo\":{{\"dimensions\":{{\"widthInPixels\":{width},\"heightInPixels\":{height}}},\
-         \"pixelDensity\":{{\"dpiX\":2,\"dpiY\":2}}}}}},\"browser\":{{\"browserName\":\"chrome\",\
+         \"pixelDensity\":{{\"dpiX\":2,\"dpiY\":2}}}}}},\"browser\":{{\"browserName\":\"edge\",\
          \"browserVersion\":\"119.0\"}}}}"
     )
 }
@@ -191,28 +188,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn os_name_mapping() {
-        assert_eq!(
-            stream_resolution_os_name(StreamResolutionMode::Auto),
-            "android"
-        );
-        assert_eq!(
-            stream_resolution_os_name(StreamResolutionMode::P720),
-            "android"
-        );
-        assert_eq!(
-            stream_resolution_os_name(StreamResolutionMode::P1080),
-            "windows"
-        );
-        assert_eq!(
-            stream_resolution_os_name(StreamResolutionMode::P1440),
-            "windows"
-        );
-        assert_eq!(
-            stream_resolution_os_name(StreamResolutionMode::P1080HQ),
-            "tizen"
-        );
-
+    fn display_dimensions() {
         assert_eq!(
             stream_resolution_display_width(StreamResolutionMode::P1080),
             1920
@@ -257,13 +233,13 @@ mod tests {
             resolution: StreamResolutionMode::P720,
             ..Default::default()
         };
-        assert_eq!(preferences.effective_os_name(), "android");
+        assert_eq!(preferences.effective_os_name(), "xbox");
 
         preferences.os_name_override = "  Tizen ".to_owned();
         assert_eq!(preferences.effective_os_name(), "tizen");
 
         preferences.os_name_override = "bogus".to_owned();
-        assert_eq!(preferences.effective_os_name(), "android");
+        assert_eq!(preferences.effective_os_name(), "xbox");
     }
 
     #[test]
@@ -272,10 +248,11 @@ mod tests {
         assert!(device_info.starts_with("{\"appInfo\":"));
         assert!(device_info.contains("\"clientAppId\":\"www.xbox.com\""));
         assert!(device_info.contains(
-            "\"os\":{\"name\":\"windows\",\"ver\":\"22631.2715\",\"platform\":\"desktop\"}"
+            "\"os\":{\"name\":\"xbox\",\"ver\":\"10.0.25398.4909\",\"platform\":\"console\"}"
         ));
         assert!(device_info.contains("\"widthInPixels\":1920,\"heightInPixels\":1080"));
-        assert!(device_info.contains("\"browserName\":\"chrome\",\"browserVersion\":\"119.0\""));
+        assert!(device_info.contains("\"model\":\"Xbox One\""));
+        assert!(device_info.contains("\"browserName\":\"edge\",\"browserVersion\":\"119.0\""));
 
         // Must be valid JSON.
         let document: Value = serde_json::from_str(&device_info).unwrap();
@@ -296,7 +273,7 @@ mod tests {
         let settings = make_stream_settings(&preferences);
         assert_eq!(settings["nanoVersion"], "V3;WebrtcTransport.dll");
         assert_eq!(settings["locale"], "de-DE");
-        assert_eq!(settings["osName"], "windows");
+        assert_eq!(settings["osName"], "xbox");
         assert_eq!(settings["sdkType"], "web");
         assert_eq!(settings["timezoneOffsetMinutes"], 120);
     }

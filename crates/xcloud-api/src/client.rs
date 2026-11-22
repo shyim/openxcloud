@@ -806,7 +806,7 @@ mod tests {
         assert_eq!(body["serverId"], "");
         assert_eq!(body["clientSessionId"], "");
         let settings = &body["settings"];
-        assert_eq!(settings["osName"], "android");
+        assert_eq!(settings["osName"], "xbox");
         assert_eq!(settings["nanoVersion"], "V3;WebrtcTransport.dll");
         assert_eq!(body["fallbackRegionNames"][0], "eastus");
     }

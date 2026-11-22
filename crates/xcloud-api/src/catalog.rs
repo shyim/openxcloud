@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use xcloud_proto::models::CatalogProduct;
+use xcloud_proto::preferences::XBOX_ONE_USER_AGENT;
 
 use crate::transport::{Headers, HttpTransport};
 use crate::{Error, Result};
@@ -376,12 +377,7 @@ fn request_headers(authorization_token: &str) -> Headers {
             "Xbox Cloud Gaming Web".to_owned(),
         ),
         ("calling-app-version".to_owned(), "21.0.0".to_owned()),
-        (
-            "User-Agent".to_owned(),
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-             (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-                .to_owned(),
-        ),
+        ("User-Agent".to_owned(), XBOX_ONE_USER_AGENT.to_owned()),
     ];
     if !authorization_token.is_empty() {
         headers.push((

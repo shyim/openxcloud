@@ -1168,7 +1168,7 @@ mod tests {
         assert_eq!(body["serverId"], "");
         assert_eq!(body["clientSessionId"], "");
         assert_eq!(body["systemUpdateGroup"], "");
-        assert_eq!(body["settings"]["osName"], "android");
+        assert_eq!(body["settings"]["osName"], "xbox");
         assert_eq!(body["settings"]["nanoVersion"], "V3;WebrtcTransport.dll");
         assert_eq!(body["fallbackRegionNames"][0], "eastus");
 
