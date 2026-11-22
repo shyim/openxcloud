@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use crossbeam_channel::Receiver;
-use egui::{Ui, pos2, vec2};
+use egui::{Key, Ui, pos2, vec2};
 use parking_lot::RwLock;
 use tokio::runtime::Handle as RuntimeHandle;
 use xcloud_media::{AudioOutput, FrameMailbox};
@@ -51,12 +51,12 @@ use crate::state::{
     Repaint, SessionCommand, SessionHandle, SessionSnapshot, Shelf, StreamCommand, StreamHandle,
     StreamSnapshot, VideoSource,
 };
-use crate::stream::{
-    HostTransport, StreamHost, StreamHostConfig, default_decoder_factory, native_gamepad_factory,
-};
+use crate::stream::{HostTransport, StreamHost, StreamHostConfig, default_decoder_factory};
 use crate::theme;
 use crate::ui::device_code::DeviceCodeView;
+use crate::ui::focus_nav;
 use crate::ui::library_view::{LibraryAction, LibraryView};
+use crate::ui::pad_nav::{self, NavAction};
 use crate::ui::settings_sheet::SettingsSheet;
 use crate::ui::signin::SignInView;
 use crate::ui::stream_view::{GpuVideo, HUD_SHORTCUTS, StreamView};
@@ -137,10 +137,14 @@ pub struct App {
     settings_store: SettingsStore,
     settings_open: bool,
     settings_sheet: SettingsSheet,
-    /// The controller polled for the settings sheet's controller test; only alive while
-    /// that test is on screen.
-    #[cfg(not(target_os = "ios"))]
-    gamepad_tester: Option<xcloud_input::native::NativeGamepad>,
+    /// Samples the shared controller for UI navigation and the settings sheet's
+    /// controller test; paused while a stream reads it. `None` without controllers
+    /// (tests, the smoke run).
+    pad_poller: Option<xcloud_input::poller::GamepadPoller>,
+    /// Controller-to-keys translation for navigating the UI.
+    pad_nav: pad_nav::PadNav,
+    /// The controller's Menu button was pressed: toggle the settings sheet this frame.
+    pad_menu: bool,
     /// Keeps macOS from opening Games/Arcade on the controller Home button mid-stream.
     system_gestures: xcloud_input::system_gestures::SystemGestureGuard,
     /// `streamLoader.active` in the previous frame, to notice the view going away.
@@ -205,6 +209,8 @@ impl App {
             Some(webrtc) => HostTransport::WebRtc(Arc::clone(webrtc)),
             None => HostTransport::Generic(Arc::clone(&services.transport)),
         };
+        // The one controller: the stream reads it while a game runs, the UI otherwise.
+        let gamepad = xcloud_input::native::SharedGamepad::new();
         let host = StreamHost::spawn(
             StreamHostConfig {
                 transport,
@@ -214,7 +220,7 @@ impl App {
                 repaint,
                 decoder: default_decoder_factory(settings.read().hardware_decode),
                 audio: AudioOutput::new(),
-                gamepad: native_gamepad_factory(),
+                gamepad: crate::stream::shared_gamepad_factory(gamepad.clone()),
             },
             &runtime,
         )
@@ -252,6 +258,19 @@ impl App {
         app.services = Some(services);
         app.session_events = Some(session_events);
         app.stream_host = Some(host);
+        match xcloud_input::poller::GamepadPoller::spawn(
+            gamepad,
+            {
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            },
+            pad_nav::is_engaged,
+        ) {
+            Ok(poller) => app.pad_poller = Some(poller),
+            Err(err) => {
+                tracing::warn!(target: LOG, "no controller navigation: cannot start the poller: {err}");
+            }
+        }
 
         // `AppController::bootstrap` + the preferences half of `refreshPreferences`.
         if let Some(services) = &app.services {
@@ -300,8 +319,9 @@ impl App {
             settings_store: store,
             settings_open: false,
             settings_sheet: SettingsSheet::new(),
-            #[cfg(not(target_os = "ios"))]
-            gamepad_tester: None,
+            pad_poller: None,
+            pad_nav: pad_nav::PadNav::new(),
+            pad_menu: false,
             system_gestures: xcloud_input::system_gestures::SystemGestureGuard::new(),
             stream_was_active: false,
             save_error_logged: false,
@@ -529,29 +549,101 @@ impl App {
                 }
             }
         }
+        if std::mem::take(&mut self.pad_menu) && route == Route::Library {
+            self.settings_open = !self.settings_open;
+        }
         if self.settings_open {
             self.settings_window(&ctx);
         }
-        self.poll_gamepad_tester(&ctx);
+        self.feed_controller_test();
+        focus_nav::end_frame(&ctx);
     }
 
-    /// Feeds the sheet's controller test for the next frame and keeps repainting while
-    /// it is visible, so the view follows the controller without other input.
-    #[cfg(not(target_os = "ios"))]
-    fn poll_gamepad_tester(&mut self, ctx: &egui::Context) {
-        if !(self.settings_open && self.settings_sheet.wants_gamepad()) {
-            self.gamepad_tester = None;
+    /// Hands the controller state to the sheet's controller test while it is on screen.
+    fn feed_controller_test(&mut self) {
+        if let Some(poller) = &self.pad_poller {
+            let testing = self.settings_open && self.settings_sheet.wants_gamepad();
+            poller.set_live(testing);
+            if testing {
+                self.settings_sheet.set_gamepad(poller.sample());
+            }
+        }
+    }
+
+    /// Moves focus for the keyboard's arrow keys with the same search the controller
+    /// uses, instead of egui's own (which gets stuck between rows and lands on buttons
+    /// nested in a tile). The handled key presses are removed from `raw_input`.
+    pub fn keyboard_navigation(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // In a stream the arrow keys are the virtual controller's D-pad.
+        if self.controllers.stream.with(|s| s.active) {
             return;
         }
-        let pad = self
-            .gamepad_tester
-            .get_or_insert_with(xcloud_input::native::NativeGamepad::new);
-        self.settings_sheet.set_gamepad(pad.sample());
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        let editing = ctx.text_edit_focused();
+        raw_input.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            let direction = match key {
+                _ if modifiers.any() => return true,
+                Key::ArrowUp => focus_nav::Direction::Up,
+                Key::ArrowDown => focus_nav::Direction::Down,
+                // A text field moves its caret with these.
+                Key::ArrowLeft | Key::ArrowRight if editing => return true,
+                Key::ArrowLeft => focus_nav::Direction::Left,
+                Key::ArrowRight => focus_nav::Direction::Right,
+                _ => return true,
+            };
+            // A slider keeps Left and Right for its value.
+            matches!(
+                focus_nav::move_focus(ctx, direction),
+                focus_nav::Move::Key(_)
+            )
+        });
     }
 
-    #[cfg(target_os = "ios")]
-    fn poll_gamepad_tester(&mut self, _ctx: &egui::Context) {}
+    /// Translates the controller into the keys egui navigates with (see
+    /// [`pad_nav`]). `raw_input` is the frame's input before egui sees it.
+    pub fn controller_input(
+        &mut self,
+        ctx: &egui::Context,
+        raw_input: &mut egui::RawInput,
+        sample: &xcloud_input::source::NativeGamepadSample,
+    ) {
+        // A stream reads the controller itself; an unfocused window must not react.
+        let stream_active = self.controllers.stream.with(|s| s.active);
+        if stream_active || !raw_input.focused || !sample.connected {
+            self.pad_nav.suspend();
+            return;
+        }
+        let now = raw_input.time.unwrap_or_else(|| ctx.input(|i| i.time));
+        // On the controller test B is being tested, not closing the sheet.
+        let testing = self.settings_open && self.settings_sheet.wants_gamepad();
+        for action in self.pad_nav.update(&sample.state, now) {
+            let key = match action {
+                NavAction::Accept => Key::Enter,
+                NavAction::Back if testing => continue,
+                NavAction::Back => Key::Escape,
+                NavAction::Menu => {
+                    self.pad_menu = true;
+                    continue;
+                }
+                NavAction::Move(direction) => match focus_nav::move_focus(ctx, direction) {
+                    focus_nav::Move::Key(key) => key,
+                    focus_nav::Move::Handled => continue,
+                },
+            };
+            raw_input.events.extend(pad_nav::key_tap(key));
+        }
+        if let Some(due) = self.pad_nav.repeat_due(now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(due));
+        }
+    }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut draft = self.controllers.settings.read().clone();
@@ -611,6 +703,15 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.shutdown();
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.keyboard_navigation(ctx, raw_input);
+        if let Some(poller) = &self.pad_poller {
+            poller.set_paused(self.controllers.stream.with(|s| s.active));
+            let sample = poller.sample();
+            self.controller_input(ctx, raw_input, &sample);
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -997,6 +1098,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use xcloud_api::token_store::MemoryTokenStore;
     use xcloud_api::transport::FakeTransport;
+    use xcloud_input::source::NativeGamepadSample;
     use xcloud_webrtc::null::NullTransport;
 
     fn harness<'a>(app: &'a mut App) -> Harness<'a> {
@@ -1054,6 +1156,189 @@ mod tests {
         app.track_play(t0 + std::time::Duration::from_secs(55));
         assert_eq!(user.read().history[0].seconds_played, 55);
         assert!(app.playing.is_none());
+    }
+
+    fn pad_sample(buttons: xcloud_proto::input::models::GamepadButtons) -> NativeGamepadSample {
+        NativeGamepadSample {
+            connected: true,
+            name: "Test Pad".into(),
+            state: xcloud_proto::input::gamepad::RawGamepadState {
+                buttons,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn pressed_keys(raw: &egui::RawInput) -> Vec<Key> {
+        raw.events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } => Some(*key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn controller_input_becomes_navigation_keys() {
+        use xcloud_proto::input::models::GamepadButtons as B;
+        let (fixture, mut app) = detached(AuthState::Authenticated);
+        let ctx = egui::Context::default();
+        let mut at = 0.0;
+        let mut feed = |app: &mut App, sample: &NativeGamepadSample, focused: bool| {
+            at += 1.0;
+            let mut raw = egui::RawInput {
+                focused,
+                time: Some(at),
+                ..Default::default()
+            };
+            app.controller_input(&ctx, &mut raw, sample);
+            pressed_keys(&raw)
+        };
+        let rest = pad_sample(B::NONE);
+
+        // Directions move focus directly; they are not keys.
+        assert!(feed(&mut app, &pad_sample(B::DPAD_DOWN), true).is_empty());
+        assert!(feed(&mut app, &rest, true).is_empty());
+        assert_eq!(feed(&mut app, &pad_sample(B::A), true), [Key::Enter]);
+        assert_eq!(feed(&mut app, &pad_sample(B::B), true), [Key::Escape]);
+        assert!(feed(&mut app, &rest, true).is_empty());
+        assert!(feed(&mut app, &pad_sample(B::MENU), true).is_empty());
+        assert!(app.pad_menu, "Menu asks for the settings sheet");
+        feed(&mut app, &rest, true);
+
+        // On the controller test B is under test and must not close the sheet.
+        app.set_settings_open(true);
+        app.settings_sheet
+            .set_category(crate::ui::settings_sheet::Category::Controller);
+        assert!(feed(&mut app, &pad_sample(B::B), true).is_empty());
+        app.set_settings_open(false);
+        feed(&mut app, &rest, true);
+
+        // A window in the background and a running stream leave the controller alone,
+        // and a button still held afterwards is not replayed.
+        assert!(feed(&mut app, &pad_sample(B::A), false).is_empty());
+        assert!(feed(&mut app, &pad_sample(B::A), true).is_empty());
+        feed(&mut app, &rest, true);
+        fixture.stream.write().active = true;
+        assert!(feed(&mut app, &pad_sample(B::A), true).is_empty());
+    }
+
+    #[test]
+    fn the_controller_opens_navigates_and_closes_settings() {
+        use xcloud_proto::input::models::GamepadButtons as B;
+        let (_fixture, app) = detached(AuthState::Authenticated);
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1280.0, 860.0))
+            .with_context_setup(theme::apply)
+            .build_ui_state(|ui, app: &mut App| app.show_in(ui), app);
+        let press = |h: &mut Harness<'_, App>, buttons: B| {
+            for buttons in [buttons, B::NONE] {
+                let ctx = h.ctx.clone();
+                let mut raw = std::mem::take(h.input_mut());
+                h.state_mut()
+                    .controller_input(&ctx, &mut raw, &pad_sample(buttons));
+                *h.input_mut() = raw;
+                h.run_steps(2);
+            }
+        };
+        h.run_steps(2);
+        press(&mut h, B::MENU);
+        assert!(h.state().settings_open(), "Menu opens the settings sheet");
+
+        // The first direction focuses a widget of the sheet, not the scrim around it.
+        press(&mut h, B::DPAD_DOWN);
+        let first = h.ctx.memory(|m| m.focused()).expect("something is focused");
+        press(&mut h, B::DPAD_DOWN);
+        let second = h.ctx.memory(|m| m.focused()).expect("focus moved on");
+        assert_ne!(first, second);
+        press(&mut h, B::A);
+        assert!(
+            h.state().settings_open(),
+            "A never closes the sheet by itself"
+        );
+
+        press(&mut h, B::B);
+        assert!(!h.state().settings_open(), "B closes the settings sheet");
+    }
+
+    #[test]
+    fn arrow_keys_move_focus_like_the_controller() {
+        let (fixture, app) = detached(AuthState::Authenticated);
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1280.0, 860.0))
+            .with_context_setup(theme::apply)
+            .build_ui_state(|ui, app: &mut App| app.show_in(ui), app);
+        h.state_mut().set_settings_open(true);
+        h.run_steps(2);
+        // Feeds a key press through the shell's input hook; returns whether the key
+        // was left for egui.
+        let press = |h: &mut Harness<'_, App>, key: Key, modifiers: Modifiers| {
+            let ctx = h.ctx.clone();
+            let mut raw = std::mem::take(h.input_mut());
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            h.state_mut().keyboard_navigation(&ctx, &mut raw);
+            let kept = !pressed_keys(&raw).is_empty();
+            raw.events.clear();
+            *h.input_mut() = raw;
+            h.run_steps(2);
+            kept
+        };
+        let focused = |h: &Harness<'_, App>| h.ctx.memory(|m| m.focused());
+
+        assert!(!press(&mut h, Key::ArrowDown, Modifiers::NONE), "handled");
+        let first = focused(&h).expect("the first press focuses a widget");
+        assert!(!press(&mut h, Key::ArrowDown, Modifiers::NONE));
+        let second = focused(&h).expect("focus moved on");
+        assert_ne!(first, second);
+        assert!(!press(&mut h, Key::ArrowUp, Modifiers::NONE));
+        assert_eq!(focused(&h), Some(first), "and back");
+
+        // Shortcuts and other keys are not navigation.
+        assert!(press(&mut h, Key::ArrowDown, Modifiers::COMMAND));
+        assert!(press(&mut h, Key::Tab, Modifiers::NONE));
+        // In a stream the arrow keys belong to the virtual controller.
+        fixture.stream.write().active = true;
+        assert!(press(&mut h, Key::ArrowDown, Modifiers::NONE));
+    }
+
+    /// Every widget that takes keyboard focus must also be a controller target, or a
+    /// controller user cannot reach it. A new focusable widget fails here until it calls
+    /// `focus_nav::register`.
+    #[test]
+    fn every_focusable_widget_is_reachable_by_controller() {
+        use crate::ui::settings_sheet::Category;
+        let screens: Vec<(&str, AuthState, Option<Category>)> = [
+            ("sign in", AuthState::Unauthenticated, None),
+            ("device code", AuthState::Authenticating, None),
+            ("library", AuthState::Authenticated, None),
+        ]
+        .into_iter()
+        .chain(
+            Category::ALL
+                .into_iter()
+                .map(|c| (c.title(), AuthState::Authenticated, Some(c))),
+        )
+        .collect();
+        for (name, state, category) in screens {
+            let (_fixture, mut app) = detached(state);
+            if let Some(category) = category {
+                app.set_settings_open(true);
+                app.settings_sheet.set_category(category);
+            }
+            let mut h = harness(&mut app);
+            h.run_steps(3);
+            let missing = focus_nav::unreachable_by_controller(&h);
+            assert!(missing.is_empty(), "{name}: not registered: {missing:#?}");
+        }
     }
 
     #[test]

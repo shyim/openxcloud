@@ -12,6 +12,7 @@ use egui::{
 use xcloud_proto::models::LibraryCard;
 
 use crate::theme::{self, Weight, font_w};
+use crate::ui::focus_nav;
 use crate::ui::icons::{self, Icon};
 use crate::ui::widgets::{self, ArtworkKind, ArtworkSource};
 
@@ -24,7 +25,9 @@ fn pointer(response: &Response) {
 }
 
 fn focus_ring(ui: &Ui, response: &Response, rect: Rect, radius: CornerRadius) {
+    focus_nav::register(ui, response);
     if response.has_focus() {
+        focus_nav::ring_drawn(ui.ctx(), response.id);
         ui.painter().rect_stroke(
             rect.expand(2.0),
             radius,
@@ -667,6 +670,7 @@ pub fn section_header(ui: &mut Ui, title: &str, link: Option<&str>) -> bool {
     );
     response.widget_info(|| WidgetInfo::labeled(Role::Link, true, link));
     pointer(&response);
+    focus_nav::register_secondary(ui, &response);
     let t = hover_t(ui, response.id, response.hovered());
     let color = mix(theme::TEXT_SECONDARY, theme::TEXT_PRIMARY, t);
     ui.painter().text(
@@ -823,6 +827,7 @@ pub fn game_tile(
     };
     response.widget_info(|| WidgetInfo::labeled(Role::Button, true, name));
     pointer(&response);
+    focus_nav::register(ui, &response);
     if !ui.is_rect_visible(rect) {
         return click;
     }
@@ -964,6 +969,7 @@ pub fn hero_card(
     );
     response.widget_info(|| WidgetInfo::labeled(Role::Button, true, card.name.as_str()));
     pointer(&response);
+    focus_nav::register(ui, &response);
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -1034,8 +1040,9 @@ pub fn game_row(ui: &mut Ui, card: &LibraryCard, artwork: &dyn ArtworkSource) ->
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
     response.widget_info(|| WidgetInfo::labeled(Role::Button, true, card.name.as_str()));
     pointer(&response);
+    focus_nav::register(ui, &response);
     if ui.is_rect_visible(rect) {
-        let t = hover_t(ui, response.id, response.hovered());
+        let t = hover_t(ui, response.id, response.hovered() || response.has_focus());
         if t > 0.0 {
             ui.painter().rect_filled(
                 rect.expand2(vec2(8.0, 0.0)),

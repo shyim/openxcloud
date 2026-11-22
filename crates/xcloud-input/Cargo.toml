@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 publish = false
 rust-version.workspace = true
-description = "Controller (gilrs) and keyboard virtual-controller sampling into the xCloud InputQueue"
+description = "Controller (GameController on macOS, gilrs elsewhere) and keyboard virtual-controller sampling into the xCloud InputQueue"
 
 [dependencies]
 xcloud-proto = { workspace = true }
@@ -14,7 +14,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 
-[target.'cfg(not(target_os = "ios"))'.dependencies]
+# Controllers everywhere but macOS, which reads them through GameController.
+[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
 gilrs = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -22,4 +23,6 @@ gilrs = { workspace = true }
 # (GCControllerElement.preferredSystemGestureState).
 objc2 = { workspace = true }
 objc2-game-controller = { workspace = true }
+# Controller rumble (GCDeviceHaptics hands out CoreHaptics engines).
+objc2-core-haptics = { workspace = true }
 objc2-foundation = { workspace = true }

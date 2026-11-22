@@ -4,8 +4,8 @@
 //! Share button takes a screenshot, even while another app is in front. The
 //! GameController framework lets the frontmost app opt out per button with
 //! `GCControllerElement.preferredSystemGestureState = .disabled`; Apple names game
-//! streaming apps as the intended use. Input still reaches the app: gilrs reads the
-//! raw HID reports, so Home keeps arriving as the Xbox Guide button.
+//! streaming apps as the intended use. Input still reaches the app: with the gesture
+//! disabled the framework delivers Home like any other button (the Xbox Guide button).
 //!
 //! The setting is per controller element and only respected while the app is
 //! frontmost, so [`SystemGestureGuard::update`] re-applies it periodically to catch

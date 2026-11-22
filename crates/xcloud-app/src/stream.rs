@@ -175,34 +175,22 @@ pub struct GamepadDevice {
     pub rumble: RumbleSink,
 }
 
-/// Builds the [`GamepadDevice`] on the input thread (gilrs wants to be created on the
-/// thread that polls it).
+/// Builds the [`GamepadDevice`] on the input thread.
 pub type GamepadFactory = Box<dyn FnOnce() -> GamepadDevice + Send>;
 
-/// The gilrs-backed controller with rumble; the "no controller" stub on iOS.
-pub fn native_gamepad_factory() -> GamepadFactory {
-    Box::new(|| {
-        #[cfg(not(target_os = "ios"))]
-        {
-            let pad = Arc::new(Mutex::new(xcloud_input::native::NativeGamepad::new()));
-            let sampler_pad = Arc::clone(&pad);
-            GamepadDevice {
-                sampler: Box::new(move || sampler_pad.lock().sample()),
-                rumble: Box::new(move |report, intensity| {
-                    match pad.lock().set_vibration(report, intensity) {
-                        Ok(played) => played,
-                        Err(error) => {
-                            tracing::warn!(target: CONTROLLER_LOG, "rumble failed: {error}");
-                            false
-                        }
-                    }
-                }),
-            }
-        }
-        #[cfg(target_os = "ios")]
-        {
-            keyboard_only_device()
-        }
+/// The stream's view of the process's shared controller: its sampler and rumble.
+pub fn shared_gamepad_factory(pad: xcloud_input::native::SharedGamepad) -> GamepadFactory {
+    Box::new(move || GamepadDevice {
+        sampler: pad.sampler(),
+        rumble: Box::new(
+            move |report, intensity| match pad.set_vibration(report, intensity) {
+                Ok(played) => played,
+                Err(error) => {
+                    tracing::warn!(target: CONTROLLER_LOG, "rumble failed: {error}");
+                    false
+                }
+            },
+        ),
     })
 }
 

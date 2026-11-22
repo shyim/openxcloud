@@ -20,7 +20,7 @@ A native Rust client with a game-first library, GPU upscaling, and streaming sta
 - **Pick up where you left off.** Recently played games live in the sidebar. Save favourites with a heart and get recommendations based on what you play.
 - **Choose your output resolution.** Upscale to **1080p, 1440p, or 4K** with AMD FSR 1.0, optional Apple MetalFX, or optional NVIDIA RTX / Intel Video Super Resolution on Windows. Adjust sharpness and change the target while playing.
 - **See what the stream is doing.** Check FPS, bitrate, network latency, and decode/GPU timings. Expand the overlay for recovery counters and 60-second performance graphs.
-- **Play with your preferred controls.** Use a supported controller with rumble, or the keyboard's virtual-controller mapping. Tune deadzones, triggers, and button layout.
+- **Play with your preferred controls.** Use a supported controller with rumble, or the keyboard's virtual-controller mapping. Tune deadzones, triggers, and button layout. The controller also drives the app itself: D-pad or left stick to move, A to select, B to go back, Menu for settings.
 - **A native streaming stack.** webrtc-rs handles transport, H.264 and Opus handle video and audio, and wgpu renders the stream. Credentials stay in the operating system's credential store.
 
 ## Get started
