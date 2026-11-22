@@ -21,6 +21,9 @@
 //! gilrs normalises stick Y so up is `+1`, matching GameController, so the values pass
 //! through untouched; `GamepadHandler::read_frame` performs the protocol flip.
 //!
+//! Exception: on macOS, Sony pads (DualSense, DualShock 4) are sampled through
+//! GameController, because gilrs receives no input from them over Bluetooth (`sony_gc`).
+//!
 //! The D-pad is read from the hat switch (`Axis::DPadX/DPadY`) whenever the controller has
 //! one, and only from the `DPad*` buttons otherwise. gilrs's default `axis_dpad_to_button`
 //! filter is disabled because it names the hat buttons with the generic native codes
@@ -280,10 +283,18 @@ mod gilrs_backend {
             let Some(pad) = active.and_then(|id| gilrs.connected_gamepad(id)) else {
                 return NativeGamepadSample::default();
             };
+            // Sony pads go through GameController on macOS (see `super::sony_gc`); the
+            // gilrs state is the fallback while GameController has not listed the pad.
+            #[cfg(target_os = "macos")]
+            let framework_state = (pad.vendor_id() == Some(super::sony_gc::SONY_VENDOR_ID))
+                .then(super::sony_gc::sample)
+                .flatten();
+            #[cfg(not(target_os = "macos"))]
+            let framework_state = None;
             NativeGamepadSample {
                 connected: true,
                 name: controller_name(&pad),
-                state: map_gamepad(&pad),
+                state: framework_state.unwrap_or_else(|| map_gamepad(&pad)),
             }
         }
 
@@ -418,6 +429,130 @@ mod gilrs_backend {
             };
             assert!(matches!(native.set_vibration(&report, 1.0), Ok(false)));
             native.stop_vibration();
+        }
+    }
+}
+
+/// DualSense / DualShock 4 sampling through Apple's GameController framework.
+///
+/// gilrs reads the HID elements the report descriptor declares. Over Bluetooth a Sony
+/// pad only sends that simple report (`0x01`) until something requests its calibration
+/// feature report; macOS's `gamecontrollerd` does so on connect, after which the pad
+/// sends the extended report (`0x31` / `0x11`) that the descriptor declares as
+/// vendor-defined data. gilrs then lists the controller but never sees a button or axis
+/// change. GameController parses the extended report, so these pads are read through it
+/// (as the Qt app's `NativeGamepad.mm` did for every controller).
+///
+/// The framework delivers values on the main queue, so this only produces input in a
+/// process that runs the main run loop (the app; not the `probe` example).
+#[cfg(target_os = "macos")]
+mod sony_gc {
+    use std::sync::Once;
+
+    use objc2::rc::autoreleasepool;
+    use objc2_game_controller::{
+        GCController, GCControllerButtonInput, GCControllerDirectionPad, GCDevice,
+        GCExtendedGamepad,
+    };
+    use xcloud_proto::input::gamepad::RawGamepadState;
+    use xcloud_proto::input::models::{GamepadButtons, Vec2};
+
+    /// USB/Bluetooth vendor id of Sony Interactive Entertainment.
+    pub const SONY_VENDOR_ID: u16 = 0x054c;
+
+    /// Whether a `GCDevice.productCategory` names a Sony pad ("DualSense",
+    /// "DualShock 4", "DualSense Edge").
+    pub fn is_sony_category(category: &str) -> bool {
+        category.starts_with("DualSense") || category.starts_with("DualShock")
+    }
+
+    /// The first Sony extended gamepad GameController lists, or `None` when it has not
+    /// (yet) picked one up.
+    pub fn sample() -> Option<RawGamepadState> {
+        static BACKGROUND: Once = Once::new();
+        // SAFETY: argument-free GameController getters; every returned object is a
+        // retained snapshot dropped before the pool drains.
+        autoreleasepool(|_| unsafe {
+            // gilrs keeps reporting while another window is in front; match that.
+            BACKGROUND.call_once(|| GCController::setShouldMonitorBackgroundEvents(true));
+            GCController::controllers().iter().find_map(|controller| {
+                if !is_sony_category(&controller.productCategory().to_string()) {
+                    return None;
+                }
+                controller.extendedGamepad().map(|pad| map(&pad))
+            })
+        })
+    }
+
+    unsafe fn stick(pad: &GCControllerDirectionPad) -> Vec2 {
+        // SAFETY: argument-free getters on a live element.
+        unsafe {
+            Vec2::new(
+                pad.xAxis().value().clamp(-1.0, 1.0),
+                pad.yAxis().value().clamp(-1.0, 1.0),
+            )
+        }
+    }
+
+    /// `NativeGamepad.mm` body: one `GCExtendedGamepad` to raw state (y is up-positive,
+    /// like gilrs).
+    unsafe fn map(pad: &GCExtendedGamepad) -> RawGamepadState {
+        let mut state = RawGamepadState::default();
+        let mut set = |button: &GCControllerButtonInput, bit: GamepadButtons| {
+            // SAFETY: argument-free getter on a live element.
+            if unsafe { button.isPressed() } {
+                state.buttons.insert(bit);
+            }
+        };
+        // SAFETY: argument-free getters on a live profile.
+        unsafe {
+            set(&pad.buttonA(), GamepadButtons::A);
+            set(&pad.buttonB(), GamepadButtons::B);
+            set(&pad.buttonX(), GamepadButtons::X);
+            set(&pad.buttonY(), GamepadButtons::Y);
+            set(&pad.buttonMenu(), GamepadButtons::MENU);
+            set(&pad.leftShoulder(), GamepadButtons::LEFT_SHOULDER);
+            set(&pad.rightShoulder(), GamepadButtons::RIGHT_SHOULDER);
+            if let Some(button) = pad.buttonOptions() {
+                set(&button, GamepadButtons::VIEW);
+            }
+            if let Some(button) = pad.buttonHome() {
+                set(&button, GamepadButtons::NEXUS);
+            }
+            if let Some(button) = pad.leftThumbstickButton() {
+                set(&button, GamepadButtons::LEFT_THUMB);
+            }
+            if let Some(button) = pad.rightThumbstickButton() {
+                set(&button, GamepadButtons::RIGHT_THUMB);
+            }
+            let dpad = pad.dpad();
+            set(&dpad.up(), GamepadButtons::DPAD_UP);
+            set(&dpad.down(), GamepadButtons::DPAD_DOWN);
+            set(&dpad.left(), GamepadButtons::DPAD_LEFT);
+            set(&dpad.right(), GamepadButtons::DPAD_RIGHT);
+
+            state.left_thumb = stick(&pad.leftThumbstick());
+            state.right_thumb = stick(&pad.rightThumbstick());
+            let (left, right) = (pad.leftTrigger(), pad.rightTrigger());
+            state.left_trigger = left.value().clamp(0.0, 1.0);
+            state.right_trigger = right.value().clamp(0.0, 1.0);
+            state.left_trigger_pressed = left.isPressed();
+            state.right_trigger_pressed = right.isPressed();
+        }
+        state
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_sony_category;
+
+        #[test]
+        fn only_sony_categories_use_the_framework() {
+            assert!(is_sony_category("DualSense"));
+            assert!(is_sony_category("DualSense Edge"));
+            assert!(is_sony_category("DualShock 4"));
+            assert!(!is_sony_category("Xbox One"));
+            assert!(!is_sony_category("MFi"));
         }
     }
 }
