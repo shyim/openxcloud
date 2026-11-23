@@ -2,6 +2,7 @@
 //! data channels into one session lifecycle. Ports `qt/src/streaming/SignalingOrchestrator`
 //! and `NativeMediaPipeline`, plus the decode thread described in docs/archive/PORTING_PLAN.md section 4.
 
+pub mod bitrate;
 pub mod decode_thread;
 pub mod error;
 pub mod orchestrator;

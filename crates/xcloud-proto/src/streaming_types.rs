@@ -233,6 +233,9 @@ pub fn stream_lifecycle_name(state: StreamLifecycleState) -> &'static str {
 #[serde(rename_all = "camelCase", default)]
 pub struct StreamingStatsSnapshot {
     pub bitrate_kbps: i32,
+    /// The bitrate ceiling asked of the sender while packet loss holds it below the
+    /// configured maximum; 0 when the maximum is requested.
+    pub bitrate_limit_kbps: i32,
     pub frames_per_second: f64,
     pub round_trip_time_ms: f64,
     pub jitter_ms: f64,

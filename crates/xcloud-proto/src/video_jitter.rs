@@ -7,6 +7,8 @@
 //! retransmit can arrive (~1 RTT), then feeds the decoder P-frames that
 //! reference the dropped frame. This buffer instead:
 //!   * holds incomplete frames for a short time so retransmits complete them,
+//!   * asks again for a packet that is still missing, because on a lossy link
+//!     the NACK or the retransmit is lost as easily as the original,
 //!   * emits complete frames strictly in timestamp (decode) order,
 //!   * on unrecoverable loss drops and refuses output until a fresh IDR.
 //!
@@ -43,6 +45,14 @@ const MAX_ACCESS_UNIT_BYTES: usize = 2 * 1024 * 1024;
 /// delay applies only while a frame is already incomplete.
 const HOLD_MS: u64 = 200;
 const MAX_FRAMES: usize = 32;
+/// How long a packet may stay missing before it is asked for again. About one
+/// round trip on a typical route; a retransmit already under way then merely
+/// arrives twice.
+const RENACK_INTERVAL_MS: u64 = 40;
+/// NACKs sent for one packet at most, the first included.
+const MAX_NACKS_PER_PACKET: u8 = 5;
+/// Bound on the packets tracked as missing (a long outage is not chased).
+const MAX_MISSING: usize = 512;
 /// Upper bound on recycled payload buffers kept around between frames.
 const MAX_SPARE_PAYLOADS: usize = 64;
 const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
@@ -54,6 +64,8 @@ pub struct Stats {
     pub frames: u32,
     pub dropped: u32,
     pub nacks: u32,
+    /// Sequence numbers seen to be missing (before any retransmit).
+    pub lost_packets: u32,
     pub resyncs: u32,
     pub last_frame_bytes: u32,
 }
@@ -81,6 +93,14 @@ struct Packet {
     payload: Vec<u8>,
 }
 
+/// A packet seen to be missing, until it arrives or is given up on.
+struct Missing {
+    seq: u16,
+    since_ms: u64,
+    last_nack_ms: u64,
+    nacks: u8,
+}
+
 struct Frame {
     timestamp: u32,
     first_seen_ms: u64,
@@ -101,6 +121,11 @@ pub struct VideoJitterBuffer {
     expected_prior: u32,
 
     stats: Stats,
+
+    /// Packets NACKed and not yet received, for asking again.
+    missing: Vec<Missing>,
+    /// Scratch: the sequence numbers of one round of repeated NACKs.
+    renack: Vec<u16>,
 
     /// Scratch: the access unit being assembled (reused across calls).
     access_unit: Vec<u8>,
@@ -124,6 +149,8 @@ impl Default for VideoJitterBuffer {
             received_prior: 0,
             expected_prior: 0,
             stats: Stats::default(),
+            missing: Vec::new(),
+            renack: Vec::new(),
             access_unit: Vec::new(),
             ordered: Vec::new(),
             spare_payloads: Vec::new(),
@@ -247,6 +274,7 @@ impl VideoJitterBuffer {
         self.last_timestamp = None;
         self.waiting_keyframe = true;
         self.stats = Stats::default();
+        self.missing.clear();
         self.have_seq = false;
         self.max_seq = 0;
         self.cycles = 0;
@@ -333,12 +361,14 @@ impl VideoJitterBuffer {
             self.received = 0;
         }
         self.received = self.received.wrapping_add(1);
+        self.missing.retain(|m| m.seq != view.sequence);
         let seq_delta = view.sequence.wrapping_sub(self.max_seq);
         if seq_delta != 0 && seq_delta < 0x8000 {
             if view.sequence < self.max_seq {
                 self.cycles = self.cycles.wrapping_add(0x10000);
             }
             let gap = seq_delta - 1;
+            self.stats.lost_packets += u32::from(gap);
             if gap > 0 && gap <= 255 {
                 let mut pid = self.max_seq.wrapping_add(1);
                 while pid != view.sequence {
@@ -354,9 +384,20 @@ impl VideoJitterBuffer {
                     self.stats.nacks += 1;
                     pid = next;
                 }
+                let mut seq = self.max_seq.wrapping_add(1);
+                while seq != view.sequence && self.missing.len() < MAX_MISSING {
+                    self.missing.push(Missing {
+                        seq,
+                        since_ms: now_ms,
+                        last_nack_ms: now_ms,
+                        nacks: 1,
+                    });
+                    seq = seq.wrapping_add(1);
+                }
             }
             self.max_seq = view.sequence;
         }
+        self.nack_again(now_ms, &mut nack);
 
         if view.payload.is_empty() {
             return outcome; // padding or empty packet: nothing to assemble
@@ -415,6 +456,51 @@ impl VideoJitterBuffer {
             break;
         }
         outcome
+    }
+
+    /// Repeats the NACK for every packet that has been missing for another
+    /// [`RENACK_INTERVAL_MS`], and forgets the ones no longer worth asking for:
+    /// a frame is only held [`HOLD_MS`], after which a keyframe is needed anyway.
+    fn nack_again(&mut self, now_ms: u64, nack: &mut impl FnMut(u16, u16)) {
+        if self.missing.is_empty() {
+            return;
+        }
+        self.missing
+            .retain(|m| now_ms.saturating_sub(m.since_ms) <= HOLD_MS);
+        self.renack.clear();
+        for m in &mut self.missing {
+            if m.nacks < MAX_NACKS_PER_PACKET
+                && now_ms.saturating_sub(m.last_nack_ms) >= RENACK_INTERVAL_MS
+            {
+                m.last_nack_ms = now_ms;
+                m.nacks += 1;
+                self.renack.push(m.seq);
+            }
+        }
+        if self.renack.is_empty() {
+            return;
+        }
+        // Ascending sequence order: every missing packet is behind `max_seq`, so the
+        // furthest behind comes first.
+        let newest = self.max_seq;
+        self.renack
+            .sort_unstable_by_key(|&seq| std::cmp::Reverse(newest.wrapping_sub(seq)));
+        let mut i = 0;
+        while i < self.renack.len() {
+            let pid = self.renack[i];
+            let mut blp: u16 = 0;
+            i += 1;
+            while i < self.renack.len() {
+                let offset = self.renack[i].wrapping_sub(pid);
+                if offset == 0 || offset > 16 {
+                    break;
+                }
+                blp |= 1u16 << (offset - 1);
+                i += 1;
+            }
+            nack(pid, blp);
+            self.stats.nacks += 1;
+        }
     }
 
     /// Finds the frame with `timestamp` or inserts a new one in timestamp
@@ -759,6 +845,75 @@ mod tests {
         assert_eq!(report.fraction_lost, 0);
         assert_eq!(report.cumulative_lost, 1);
         assert_eq!(report.highest_seq_ext, 0x10002);
+    }
+
+    /// Feeds an empty-payload packet (a padding probe): it advances the sequence
+    /// tracking and the clock without touching any frame.
+    fn tick(buffer: &mut VideoJitterBuffer, seq: u16, now_ms: u64) -> Vec<(u16, u16)> {
+        let mut nacks = Vec::new();
+        buffer.receive(
+            &rtp_packet(seq, 9000, false, &[]),
+            now_ms,
+            |_| {},
+            |p, b| nacks.push((p, b)),
+        );
+        nacks
+    }
+
+    #[test]
+    fn a_packet_still_missing_is_asked_for_again() {
+        let mut buffer = VideoJitterBuffer::new();
+        assert!(tick(&mut buffer, 1, 0).is_empty());
+        // 2 and 3 are lost.
+        assert_eq!(tick(&mut buffer, 4, 0), vec![(2, 0x0001)]);
+        // Nothing is repeated before the interval has passed.
+        assert!(tick(&mut buffer, 5, 30).is_empty());
+        assert_eq!(tick(&mut buffer, 6, RENACK_INTERVAL_MS), vec![(2, 0x0001)]);
+        // The retransmit of 3 arrives; only 2 is repeated from now on.
+        assert!(tick(&mut buffer, 3, 50).is_empty());
+        assert_eq!(tick(&mut buffer, 7, 2 * RENACK_INTERVAL_MS), vec![(2, 0)]);
+        // Once 2 arrives too there is nothing left to ask for.
+        assert!(tick(&mut buffer, 2, 90).is_empty());
+        assert!(tick(&mut buffer, 8, 3 * RENACK_INTERVAL_MS).is_empty());
+    }
+
+    #[test]
+    fn packets_missing_from_separate_gaps_share_a_repeated_nack() {
+        let mut buffer = VideoJitterBuffer::new();
+        tick(&mut buffer, 1, 0);
+        assert_eq!(tick(&mut buffer, 3, 0), vec![(2, 0)]);
+        tick(&mut buffer, 4, 0);
+        assert_eq!(tick(&mut buffer, 6, 0), vec![(5, 0)]);
+        // Both are due together: one item, 5 being three after 2.
+        assert_eq!(tick(&mut buffer, 7, RENACK_INTERVAL_MS), vec![(2, 0x0004)]);
+    }
+
+    #[test]
+    fn asking_again_stops_after_the_hold_time_and_the_retry_limit() {
+        let mut buffer = VideoJitterBuffer::new();
+        tick(&mut buffer, 1, 0);
+        assert_eq!(tick(&mut buffer, 3, 0), vec![(2, 0)]);
+        // One packet every 10 ms for a second.
+        let repeats: usize = (4..)
+            .zip((10..1000).step_by(10))
+            .map(|(seq, now_ms)| tick(&mut buffer, seq, now_ms).len())
+            .sum();
+        // Repeats at 40, 80, 120 and 160 ms; the frame hold ends at 200 ms and the
+        // limit is five NACKs in all.
+        assert_eq!(repeats, usize::from(MAX_NACKS_PER_PACKET) - 1);
+        assert_eq!(buffer.stats().nacks, u32::from(MAX_NACKS_PER_PACKET));
+    }
+
+    #[test]
+    fn repeated_nacks_are_ordered_across_the_sequence_wrap() {
+        let mut buffer = VideoJitterBuffer::new();
+        tick(&mut buffer, 0xfffd, 0);
+        // 0xfffe, 0xffff and 0 are lost.
+        assert_eq!(tick(&mut buffer, 1, 0), vec![(0xfffe, 0x0003)]);
+        assert_eq!(
+            tick(&mut buffer, 2, RENACK_INTERVAL_MS),
+            vec![(0xfffe, 0x0003)]
+        );
     }
 
     #[test]

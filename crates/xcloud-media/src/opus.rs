@@ -81,8 +81,8 @@ impl OpusDecoder {
     /// duration of the missing packet, 960 for 20 ms at 48 kHz) from the decoder state and
     /// appends them to `out`. Returns the number of samples per channel produced.
     ///
-    /// The C++ pipeline has no concealment (it simply skips lost packets); this is the
-    /// `opus_decode(NULL)` path the Rust jitter buffer may use instead.
+    /// The C++ pipeline had no concealment (it simply skipped lost packets); this is the
+    /// `opus_decode(NULL)` path, for a lost frame no later packet can recover.
     pub fn conceal(&mut self, samples_per_channel: usize, out: &mut Vec<i16>) -> usize {
         let Some(inner) = self.inner.as_mut() else {
             return 0;
@@ -91,6 +91,45 @@ impl OpusDecoder {
         let offset = out.len();
         out.resize(offset + samples_per_channel * channels, 0);
         match inner.decode(&[], &mut out[offset..], false) {
+            Ok(decoded) if decoded > 0 => {
+                out.truncate(offset + decoded * channels);
+                self.last_error = None;
+                decoded
+            }
+            Ok(_) => {
+                out.truncate(offset);
+                0
+            }
+            Err(err) => {
+                out.truncate(offset);
+                self.last_error = Some(err.to_string());
+                0
+            }
+        }
+    }
+
+    /// Recovers a lost frame from the in-band FEC copy the *next* packet carries
+    /// (`useinbandfec=1`): `next_packet` is the packet after the gap and
+    /// `samples_per_channel` the lost frame's length. libopus falls back to concealment
+    /// by itself when the packet has no FEC data. Returns the samples per channel
+    /// appended to `out`, 0 on failure. Decode `next_packet` normally afterwards.
+    pub fn decode_fec(
+        &mut self,
+        next_packet: &[u8],
+        samples_per_channel: usize,
+        out: &mut Vec<i16>,
+    ) -> usize {
+        let Some(inner) = self.inner.as_mut() else {
+            return 0;
+        };
+        if next_packet.is_empty() || samples_per_channel == 0 {
+            return 0;
+        }
+        let channels = usize::from(self.channels);
+        let offset = out.len();
+        // With FEC the output length is the amount of audio to recover, exactly.
+        out.resize(offset + samples_per_channel * channels, 0);
+        match inner.decode(next_packet, &mut out[offset..], true) {
             Ok(decoded) if decoded > 0 => {
                 out.truncate(offset + decoded * channels);
                 self.last_error = None;
@@ -243,6 +282,26 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(decoder.decode(&[], &mut out), 0);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn fec_decode_fills_exactly_the_lost_frame() {
+        let mut decoder = OpusDecoder::default();
+        let packet = encode_frame(&test_tone());
+        let mut out = Vec::new();
+        decoder.decode(&packet, &mut out);
+        out.clear();
+        // The next packet stands in for the lost one (FEC data or concealment).
+        assert_eq!(
+            decoder.decode_fec(&packet, SAMPLES_PER_CHANNEL, &mut out),
+            SAMPLES_PER_CHANNEL
+        );
+        assert_eq!(out.len(), SAMPLES_PER_CHANNEL * 2);
+        // The stream continues with the packet itself.
+        assert_eq!(decoder.decode(&packet, &mut out), SAMPLES_PER_CHANNEL);
+        // Nothing to recover from.
+        assert_eq!(decoder.decode_fec(&[], SAMPLES_PER_CHANNEL, &mut out), 0);
+        assert_eq!(decoder.decode_fec(&packet, 0, &mut out), 0);
     }
 
     #[test]
