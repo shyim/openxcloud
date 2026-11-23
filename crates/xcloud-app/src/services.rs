@@ -160,6 +160,7 @@ impl Services {
             }
             SessionEvent::SignedOut => {
                 self.update_api_credentials(&StreamTokens::default());
+                library.send(LibraryCommand::ForgetAccount);
             }
         }
     }
@@ -430,7 +431,9 @@ mod tests {
         services.handle_session_event(&SessionEvent::SignedOut, &library);
         assert_eq!(services.api.base_host(), "");
         assert_eq!(services.api.gs_token(), "");
-        assert!(commands.try_recv().is_err(), "sign-out does not refresh");
+        // Sign-out does not refresh; it drops the title list kept for the next launch.
+        assert_eq!(commands.try_recv(), Ok(LibraryCommand::ForgetAccount));
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]

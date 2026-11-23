@@ -683,6 +683,7 @@ mod tests {
                     is_default: false,
                 },
             ],
+            expires_at: 1_700_000_000,
         }
     }
 
@@ -777,7 +778,8 @@ mod tests {
                 "xcloudRegions": [
                     {"name": "weu", "baseUri": "https://weu.gssv-play-prod.xboxlive.com", "isDefault": true},
                     {"name": "eus", "baseUri": "https://eus.gssv-play-prod.xboxlive.com", "isDefault": false}
-                ]
+                ],
+                "expiresAt": 1_700_000_000_i64
             })
         );
         // serde derive and the hand-written codec agree.

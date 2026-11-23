@@ -522,7 +522,14 @@ impl App {
             self.last_route = Some(route);
         }
         match route {
-            Route::Loading => loading_screen(ui),
+            Route::Loading => {
+                // Only a wait that is not the normal start-up gets a line of its own.
+                let note = self.controllers.session.with(|s| {
+                    (s.status_text == session::STATUS_WAITING_FOR_NETWORK)
+                        .then(|| s.status_text.clone())
+                });
+                loading_screen(ui, note.as_deref());
+            }
             Route::SignIn => self.sign_in.show(
                 ui,
                 &self.controllers.session,
@@ -721,7 +728,7 @@ impl eframe::App for App {
 }
 
 /// `loadingComponent`: a busy indicator with "Starting" 24 pt below the centre.
-pub fn loading_screen(ui: &mut Ui) {
+pub fn loading_screen(ui: &mut Ui, note: Option<&str>) {
     let full = ui.available_rect_before_wrap();
     ui.painter().rect_filled(full, 0.0, theme::BACKGROUND);
     let centre = full.center();
@@ -740,6 +747,18 @@ pub fn loading_screen(ui: &mut Ui) {
                 .color(theme::TEXT_PRIMARY),
         ),
     );
+    if let Some(note) = note {
+        let line =
+            egui::Rect::from_min_size(pos2(full.left(), centre.y + 52.0), vec2(full.width(), 22.0));
+        ui.put(
+            line,
+            egui::Label::new(
+                egui::RichText::new(note)
+                    .size(theme::FONT_BODY - 2.0)
+                    .color(theme::TEXT_SECONDARY),
+            ),
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------- detached

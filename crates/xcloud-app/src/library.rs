@@ -555,6 +555,97 @@ fn save_catalog_file(path: &Path, file: &CatalogFile) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// The file in `dir` that keeps the account's title list between launches.
+pub fn titles_cache_path(dir: &Path) -> PathBuf {
+    dir.join("titles.json")
+}
+
+/// One title as kept on disk (the fields `adopt_titles` reads).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CachedTitle {
+    title_id: String,
+    product_id: String,
+    name: String,
+    has_entitlement: bool,
+    supported_input_types: Vec<String>,
+}
+
+impl From<&XCloudTitleDTO> for CachedTitle {
+    fn from(dto: &XCloudTitleDTO) -> Self {
+        Self {
+            title_id: dto.title_id.clone(),
+            product_id: dto.product_id.clone(),
+            name: dto.name.clone(),
+            has_entitlement: dto.has_entitlement,
+            supported_input_types: dto.supported_input_types.clone(),
+        }
+    }
+}
+
+impl From<CachedTitle> for XCloudTitleDTO {
+    fn from(title: CachedTitle) -> Self {
+        Self {
+            title_id: title.title_id,
+            product_id: title.product_id,
+            name: title.name,
+            has_entitlement: title.has_entitlement,
+            supported_input_types: title.supported_input_types,
+        }
+    }
+}
+
+/// The title list of the last launch: what the library shows until the service answers.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct TitlesFile {
+    saved_at: u64,
+    titles: Vec<CachedTitle>,
+    mru: Vec<CachedTitle>,
+}
+
+impl TitlesFile {
+    fn of(titles: &XCloudTitlesResponse, mru: Option<&XCloudTitlesResponse>) -> Self {
+        let cached = |response: &XCloudTitlesResponse| {
+            response.results.iter().map(CachedTitle::from).collect()
+        };
+        Self {
+            saved_at: unix_now(),
+            titles: cached(titles),
+            mru: mru.map(cached).unwrap_or_default(),
+        }
+    }
+
+    fn into_responses(self) -> (XCloudTitlesResponse, XCloudTitlesResponse) {
+        let response = |titles: Vec<CachedTitle>| XCloudTitlesResponse {
+            results: titles.into_iter().map(XCloudTitleDTO::from).collect(),
+        };
+        (response(self.titles), response(self.mru))
+    }
+}
+
+/// Reads the title list file; a missing or unreadable file is an empty list.
+fn load_titles_file(path: &Path) -> TitlesFile {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            tracing::warn!(target: LOG, "ignoring title cache {}: {error}", path.display());
+            TitlesFile::default()
+        }),
+        Err(_) => TitlesFile::default(),
+    }
+}
+
+/// Writes the title list file atomically.
+fn save_titles_file(path: &Path, file: &TitlesFile) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let bytes = serde_json::to_vec(file).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// The catalog query for an app locale such as `de-DE`.
 pub fn catalog_query_for(locale: &str) -> CatalogQuery {
     let code = xcloud_proto::locales::find(locale)
@@ -628,6 +719,7 @@ impl LibraryController {
             LibraryCommand::SetBrowseShelf(id) => self.set_browse_shelf(&id),
             LibraryCommand::SetLocale(locale) => self.set_locale(&locale),
             LibraryCommand::SetLicensedOnly(value) => self.set_licensed_only(value),
+            LibraryCommand::ForgetAccount => self.forget_account(),
         }
     }
 
@@ -700,9 +792,30 @@ impl LibraryController {
             .catalog_cache_dir
             .as_deref()
             .map(|dir| catalog_cache_path(dir, &query));
+        let titles_path = self.catalog_cache_dir.as_deref().map(titles_cache_path);
         self.runtime.spawn(async move {
-            load_library(api, catalog, shared, generation, query, cache_path).await
+            load_library(
+                api,
+                catalog,
+                shared,
+                generation,
+                query,
+                cache_path,
+                titles_path,
+            )
+            .await
         });
+    }
+
+    /// Forgets the title list kept for the next launch (the account signed out, so the
+    /// next one must not briefly see this one's games).
+    pub fn forget_account(&self) {
+        if let Some(path) = self.catalog_cache_dir.as_deref().map(titles_cache_path)
+            && let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(target: LOG, "cannot remove the title cache: {error}");
+        }
     }
 
     /// `setQuery`: filters the grid immediately (debounce is the UI's job).
@@ -792,8 +905,36 @@ fn library_error_text(error: &xcloud_api::Error) -> String {
     }
 }
 
+/// Adopts a title list and re-applies every known catalog product (the disk cache
+/// included) so cards have their names and art at once. Returns the product ids to
+/// hydrate.
+fn adopt_with_catalog(
+    inner: &mut Inner,
+    titles: &XCloudTitlesResponse,
+    mru: Option<&XCloudTitlesResponse>,
+    disk: &CatalogFile,
+) -> Vec<String> {
+    let product_ids = inner.adopt_titles(titles, mru);
+    for product in &disk.products {
+        if !product.product_id.is_empty() {
+            inner
+                .catalog_cache
+                .insert(product.product_id.clone(), product.clone());
+        }
+    }
+    if !inner.catalog_cache.is_empty() {
+        let cached: Vec<CatalogProduct> = inner.catalog_cache.values().cloned().collect();
+        inner.apply_catalog_batch(&cached);
+    }
+    product_ids
+}
+
 /// The asynchronous body of `refresh`. Every step re-checks `generation` so a
 /// superseded load never publishes.
+///
+/// On the first load of a launch the title list saved by the previous one is shown
+/// straight away, with the catalog cache's names and art, while the service is asked
+/// for the current list.
 async fn load_library(
     api: Arc<XCloudApiClient>,
     catalog: Option<Arc<GamePassCatalogClient>>,
@@ -801,17 +942,56 @@ async fn load_library(
     generation: u64,
     query: CatalogQuery,
     cache_path: Option<PathBuf>,
+    titles_path: Option<PathBuf>,
 ) {
-    // The catalog of the last launch, read while the titles load.
-    let disk = match cache_path.clone() {
-        Some(path) => tokio::task::spawn_blocking(move || load_catalog_file(&path))
-            .await
-            .unwrap_or_default(),
-        None => CatalogFile::default(),
+    // The catalog and the title list of the last launch.
+    let first_load = !shared.inner.lock().did_load;
+    let (disk, cached_titles) = {
+        let cache_path = cache_path.clone();
+        let titles_path = titles_path.clone().filter(|_| first_load);
+        tokio::task::spawn_blocking(move || {
+            (
+                cache_path
+                    .map(|path| load_catalog_file(&path))
+                    .unwrap_or_default(),
+                titles_path
+                    .map(|path| load_titles_file(&path))
+                    .unwrap_or_default(),
+            )
+        })
+        .await
+        .unwrap_or_default()
     };
     let disk_fresh = !disk.products.is_empty()
         && unix_now().saturating_sub(disk.saved_at) < CATALOG_CACHE_TTL.as_secs();
-    let titles = match api.get_cloud_titles().await {
+
+    let mut showing_cached = false;
+    if !cached_titles.titles.is_empty() {
+        let (titles, mru) = cached_titles.into_responses();
+        let mut inner = shared.inner.lock();
+        if inner.load_generation != generation {
+            return;
+        }
+        adopt_with_catalog(&mut inner, &titles, Some(&mru), &disk);
+        inner.rebuild_filtered(true);
+        // Loaded as far as the UI is concerned; `is_loading` stays set until the
+        // service has answered.
+        inner.did_load = true;
+        showing_cached = true;
+        tracing::info!(
+            target: LOG,
+            "library: showing {} titles saved by the last launch",
+            inner.raw_items.len()
+        );
+        shared.publish(&inner);
+    }
+
+    // Neither request needs the other.
+    let (titles, mru) = tokio::join!(
+        api.get_cloud_titles(),
+        api.get_cloud_titles_mru(DEFAULT_MRU_LIMIT)
+    );
+    let titles = match titles {
         Ok(titles) => titles,
         Err(error) => {
             let mut inner = shared.inner.lock();
@@ -823,15 +1003,14 @@ async fn load_library(
             inner.authentication_required =
                 matches!(error, xcloud_api::Error::Status { status: 401, .. });
             inner.last_error = library_error_text(&error);
+            if showing_cached {
+                tracing::warn!(target: LOG, "library refresh failed, keeping the saved titles: {error}");
+            }
             shared.publish(&inner);
             return;
         }
     };
-    if shared.inner.lock().load_generation != generation {
-        return;
-    }
 
-    let mru = api.get_cloud_titles_mru(DEFAULT_MRU_LIMIT).await;
     let all_ids: Vec<String>;
     let product_ids = {
         let mut inner = shared.inner.lock();
@@ -845,18 +1024,15 @@ async fn load_library(
                 None
             }
         };
-        let product_ids = inner.adopt_titles(&titles, mru);
-        for product in &disk.products {
-            if !product.product_id.is_empty() {
-                inner
-                    .catalog_cache
-                    .insert(product.product_id.clone(), product.clone());
-            }
+        if let Some(path) = titles_path {
+            let file = TitlesFile::of(&titles, mru);
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = save_titles_file(&path, &file) {
+                    tracing::warn!(target: LOG, "cannot save the title cache: {error}");
+                }
+            });
         }
-        if !inner.catalog_cache.is_empty() {
-            let cached: Vec<CatalogProduct> = inner.catalog_cache.values().cloned().collect();
-            inner.apply_catalog_batch(&cached);
-        }
+        let product_ids = adopt_with_catalog(&mut inner, &titles, mru, &disk);
 
         // Publish the library as soon as the titles arrive. Catalog enrichment
         // fetches ~28 batches and must never hold the library hostage behind a
@@ -1339,6 +1515,61 @@ mod tests {
             h.catalog_batches().is_empty(),
             "a fresh cache is not refetched"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_title_list_of_the_last_launch_shows_before_the_service_answers() {
+        let dir = std::env::temp_dir().join(format!(
+            "openxcloud-title-cache-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let file = titles_cache_path(&dir);
+
+        // First launch: the list comes from the service and is written to disk.
+        let h = Harness::new().with_cache_dir(&dir);
+        enqueue_enriched_library(&h.transport);
+        h.controller.refresh(true);
+        wait_for(8000, || file.exists()).await;
+        wait_for(8000, || !h.controller.is_loading()).await;
+        let saved = load_titles_file(&file);
+        assert_eq!(saved.titles.len(), 2);
+        assert_eq!(saved.mru.len(), 1);
+        wait_for(8000, || {
+            load_catalog_file(&catalog_cache_path(&dir, &CatalogQuery::default()))
+                .products
+                .len()
+                == 2
+        })
+        .await;
+
+        // Next launch, service unreachable: the saved games are there anyway, with their
+        // catalog names, and the failed refresh does not replace them with an error.
+        let h = Harness::new().with_cache_dir(&dir);
+        h.transport.enqueue_error("/v2/titles", "offline");
+        h.transport.enqueue_error("/v2/titles/mru", "offline");
+        h.controller.refresh(true);
+        wait_for(8000, || !h.controller.is_loading()).await;
+        assert_eq!(h.game_count(), 2);
+        assert_eq!(h.item_name("T1"), "Alpha Deluxe");
+        let snapshot = h.controller.snapshot();
+        assert!(!snapshot.authentication_required);
+        assert!(!snapshot.is_empty());
+
+        // A rejected session still asks for a new sign-in over the saved games.
+        let h = Harness::new().with_cache_dir(&dir);
+        h.transport.enqueue_json("/v2/titles", "{}", 401);
+        h.transport
+            .enqueue_json("/v2/titles/mru", r#"{"results":[]}"#, 200);
+        h.controller.refresh(true);
+        wait_for(8000, || !h.controller.is_loading()).await;
+        assert!(h.controller.snapshot().authentication_required);
+
+        // Signing out drops the saved list, so the next account starts empty.
+        h.controller.forget_account();
+        assert!(!file.exists());
+        h.controller.forget_account();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

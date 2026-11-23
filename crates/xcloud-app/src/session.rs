@@ -56,10 +56,30 @@ use xcloud_api::auth::{
     DEFAULT_POLL_MAX_WAIT_SECS, DeviceCodeInfo, MicrosoftAuthService, StreamTokens,
 };
 
+use xcloud_api::Error as ApiError;
+
 use crate::services::Services;
 use crate::state::{AuthState, Handle, Repaint, SessionCommand, SessionHandle, SessionSnapshot};
 
 const LOG: &str = "Session";
+
+/// Stored stream tokens count as usable at launch when they stay valid at least this
+/// long: enough to load the library and start a game before the renewal lands.
+const FRESH_MARGIN_SECS: i64 = 10 * 60;
+
+/// Status while the stored login cannot be renewed because the network does not answer.
+pub const STATUS_WAITING_FOR_NETWORK: &str = "Waiting for the network\u{2026}";
+
+/// First and longest pause between attempts to renew the login without a network.
+const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The wall clock as Unix seconds (what `StreamTokens::expires_at` is measured in).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
 
 /// What `SessionController` signalled to `AppController`.
 #[derive(Debug, Clone, PartialEq)]
@@ -261,20 +281,31 @@ impl SessionController {
 
     /// `m_tokens = m_auth->restoreStreamTokens()` of the C++ constructor.
     fn load_stored_tokens(&self) {
+        let started = std::time::Instant::now();
         let tokens = self.auth.restore_stream_tokens().unwrap_or_else(|error| {
             tracing::warn!(target: LOG, "cannot read the stored stream tokens: {error}");
             StreamTokens::default()
         });
+        // The keychain can be slow (or wait on a system prompt); make that visible.
+        tracing::info!(
+            target: LOG,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            present = tokens.is_valid(),
+            "stored session read"
+        );
         *self.tokens.lock() = tokens;
     }
 
     /// `AppController::bootstrap`: `updateApiCredentials()` with the stored bundle, then
     /// `SessionController::restoreSession`.
+    ///
+    /// Stream tokens are renewed on every launch. When the stored ones are known to be
+    /// valid for a while yet, the app is authenticated with them at once and the renewal
+    /// runs behind the library instead of in front of it; otherwise the "Starting"
+    /// screen stays up until the renewal is through, as the C++ always did.
     async fn restore_session(self: Arc<Self>) {
         let tokens = self.tokens.lock().clone();
         self.emit(SessionEvent::TokensRestored(Box::new(tokens.clone())));
-        // is_valid only means a token is present; persisted GSSV tokens may be
-        // expired. Always renew using the stored refresh token before authenticating.
         let has_session = self.auth.has_stored_session().unwrap_or_else(|error| {
             tracing::warn!(target: LOG, "cannot read the stored refresh token: {error}");
             false
@@ -284,10 +315,46 @@ impl SessionController {
             return;
         }
 
+        if tokens.is_fresh(unix_now(), FRESH_MARGIN_SECS) {
+            tracing::info!(
+                target: LOG,
+                valid_for_s = tokens.expires_at - unix_now(),
+                "stored stream tokens are still valid; renewing in the background"
+            );
+            self.emit(SessionEvent::Authenticated(Box::new(tokens)));
+            self.set_state(AuthState::Authenticated);
+            self.renew_in_background().await;
+            return;
+        }
+
         self.set_busy(true);
         self.set_status("Signing in");
         self.set_state(AuthState::Unknown);
-        let result = self.auth.refresh_stream_tokens().await;
+        let started = std::time::Instant::now();
+        // No answer from the network says nothing about the stored login: keep it and
+        // keep trying, instead of signing the user out over a bad connection.
+        let mut retry_in = RETRY_FIRST;
+        let result = loop {
+            match self.auth.refresh_stream_tokens().await {
+                Err(error @ (ApiError::Http(_) | ApiError::Timeout(_))) => {
+                    tracing::warn!(
+                        target: LOG,
+                        retry_in_s = retry_in.as_secs(),
+                        "cannot reach the sign-in service: {error}"
+                    );
+                    self.set_status(STATUS_WAITING_FOR_NETWORK);
+                    tokio::time::sleep(retry_in).await;
+                    retry_in = (retry_in * 2).min(RETRY_MAX);
+                }
+                result => break result,
+            }
+        };
+        tracing::info!(
+            target: LOG,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            ok = result.is_ok(),
+            "stream tokens renewed"
+        );
         self.set_busy(false);
         self.set_status("");
         match result {
@@ -301,6 +368,39 @@ impl SessionController {
                 if let Err(clear_error) = self.auth.clear_session() {
                     tracing::warn!(target: LOG, "clearing the stale session failed: {clear_error}");
                 }
+                self.set_state(AuthState::Unauthenticated);
+            }
+        }
+    }
+
+    /// Renews the stream tokens while the app already runs on the stored ones. The new
+    /// bundle only replaces the API credentials ([`SessionEvent::TokensRestored`]); the
+    /// library is not reloaded for it.
+    async fn renew_in_background(&self) {
+        let started = std::time::Instant::now();
+        match self.auth.refresh_stream_tokens().await {
+            Ok(tokens) => {
+                tracing::info!(
+                    target: LOG,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "stream tokens renewed in the background"
+                );
+                self.set_tokens(tokens.clone());
+                self.emit(SessionEvent::TokensRestored(Box::new(tokens)));
+            }
+            // No answer from the network: the stored tokens are still good, so stay
+            // signed in and try again on the next launch.
+            Err(error @ (ApiError::Http(_) | ApiError::Timeout(_))) => {
+                tracing::warn!(target: LOG, "background token renewal failed, keeping the stored tokens: {error}");
+            }
+            // The service refused the stored login: it is over.
+            Err(error) => {
+                tracing::warn!(target: LOG, "Session restore failed: {error}");
+                if let Err(clear_error) = self.auth.clear_session() {
+                    tracing::warn!(target: LOG, "clearing the stale session failed: {clear_error}");
+                }
+                *self.tokens.lock() = StreamTokens::default();
+                self.emit(SessionEvent::SignedOut);
                 self.set_state(AuthState::Unauthenticated);
             }
         }
@@ -648,6 +748,99 @@ mod tests {
         assert_eq!(h.transport.request_count(), 0);
     }
 
+    /// Stored tokens that are valid for another hour.
+    fn fresh_tokens() -> StreamTokens {
+        StreamTokens {
+            expires_at: unix_now() + 3600,
+            ..stored_tokens()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_stored_tokens_authenticate_before_the_renewal() {
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save_refresh_token("R1").unwrap();
+        store.save_stream_tokens(&fresh_tokens()).unwrap();
+        let h = harness_with_store(store);
+        // The renewal is slow; the app must not wait for it.
+        h.transport.enqueue_json_delayed(
+            "oauth2/v2.0/token",
+            r#"{"access_token":"MSA","refresh_token":"R2"}"#,
+            5_000,
+        );
+        enqueue_exchange(&h.transport);
+
+        h.session.send(SessionCommand::RestoreSession);
+        wait_until(&h.session, |s| s.state == AuthState::Authenticated).await;
+        assert_eq!(
+            h.store.load_refresh_token().unwrap(),
+            "R1",
+            "not renewed yet"
+        );
+        let snapshot = h.session.read();
+        assert!(!snapshot.is_busy, "no Starting screen, no spinner");
+        expect_tokens_restored(&h, &fresh_tokens());
+        assert_eq!(
+            h.events.try_recv(),
+            Ok(SessionEvent::Authenticated(Box::new(fresh_tokens()))),
+            "authenticated with the stored bundle"
+        );
+
+        // The renewal lands later and only swaps the credentials: no second
+        // `Authenticated`, so the library is not loaded twice.
+        let store = h.store.clone();
+        wait_until(&h.session, move |_| {
+            store.load_refresh_token().unwrap() == "R2"
+        })
+        .await;
+        tokio::task::yield_now().await;
+        match h.events.try_recv() {
+            Ok(SessionEvent::TokensRestored(tokens)) => {
+                assert_eq!(tokens.xcloud_token, "XCLOUD", "the renewed bundle");
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        assert!(h.events.try_recv().is_err());
+        assert_eq!(h.session.read().state, AuthState::Authenticated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_background_renewal_keeps_valid_tokens_unless_refused() {
+        // No answer from the network: stay signed in on the stored tokens.
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save_refresh_token("R1").unwrap();
+        store.save_stream_tokens(&fresh_tokens()).unwrap();
+        let h = harness_with_store(store);
+        h.transport.enqueue_error("oauth2/v2.0/token", "offline");
+        h.session.send(SessionCommand::RestoreSession);
+        wait_until(&h.session, |s| s.state == AuthState::Authenticated).await;
+        let transport = h.transport.clone();
+        wait_until(&h.session, move |_| transport.pending_count() == 0).await;
+        tokio::task::yield_now().await;
+        assert_eq!(h.session.read().state, AuthState::Authenticated);
+        assert_eq!(h.store.load_refresh_token().unwrap(), "R1", "session kept");
+
+        // The service refusing the stored login ends the session.
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save_refresh_token("R1").unwrap();
+        store.save_stream_tokens(&fresh_tokens()).unwrap();
+        let h = harness_with_store(store);
+        h.transport.enqueue_json(
+            "oauth2/v2.0/token",
+            r#"{"error":"invalid_grant","error_description":"expired"}"#,
+            400,
+        );
+        h.session.send(SessionCommand::RestoreSession);
+        wait_until(&h.session, |s| s.state == AuthState::Unauthenticated).await;
+        assert_eq!(h.store.load_refresh_token().unwrap(), "", "session cleared");
+        expect_tokens_restored(&h, &fresh_tokens());
+        assert!(matches!(
+            h.events.try_recv(),
+            Ok(SessionEvent::Authenticated(_))
+        ));
+        assert_eq!(h.events.try_recv(), Ok(SessionEvent::SignedOut));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn restore_with_refresh_token_refreshes_stream_tokens() {
         let store = Arc::new(MemoryTokenStore::new());
@@ -693,6 +886,33 @@ mod tests {
             *h.events_queued_at_first_authenticated_frame.lock(),
             vec![2]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_network_at_launch_keeps_the_login_and_retries() {
+        let store = Arc::new(MemoryTokenStore::new());
+        store.save_refresh_token("R1").unwrap();
+        let h = harness_with_store(store);
+        // Two attempts get no answer, the third goes through.
+        h.transport.enqueue_error("oauth2/v2.0/token", "offline");
+        h.transport.enqueue_error("oauth2/v2.0/token", "offline");
+        h.transport.enqueue_json(
+            "oauth2/v2.0/token",
+            r#"{"access_token":"MSA","refresh_token":"R2"}"#,
+            200,
+        );
+        enqueue_exchange(&h.transport);
+
+        h.session.send(SessionCommand::RestoreSession);
+        wait_until(&h.session, |s| s.status_text == STATUS_WAITING_FOR_NETWORK).await;
+        let waiting = h.session.read();
+        assert_eq!(waiting.state, AuthState::Unknown, "still starting");
+        assert_eq!(h.store.load_refresh_token().unwrap(), "R1", "login kept");
+
+        wait_until(&h.session, |s| s.state == AuthState::Authenticated).await;
+        assert_eq!(h.session.read().status_text, "");
+        assert_eq!(h.store.load_refresh_token().unwrap(), "R2");
+        assert_eq!(count_requests(&h.transport, "oauth2/v2.0/token"), 3);
     }
 
     #[tokio::test(start_paused = true)]
