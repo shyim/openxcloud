@@ -28,23 +28,31 @@ use std::time::Instant;
 use crossbeam_channel::Sender;
 use xcloud_media::OpusDecoder;
 use xcloud_media::annexb::{find_parameter_sets, is_idr};
-use xcloud_proto::audio_jitter::AudioJitterBuffer;
+use xcloud_proto::audio_jitter::{AudioJitterBuffer, Popped};
 use xcloud_proto::rtp::parse_rtp_packet;
 use xcloud_proto::streaming_config::StreamingConfig;
 use xcloud_proto::streaming_types::StreamingStatsSnapshot;
 use xcloud_proto::video_jitter::{Stats as VideoStats, VideoJitterBuffer};
 use xcloud_webrtc::{MediaSink, RtcpSender};
 
+use crate::bitrate::{BitrateController, Interval};
 use crate::decode_thread::{DecodeFeedback, DecodeLatency, DecodeThread, SubmitOutcome};
 
 const LOG: &str = "Video";
 
-// REMB asks the sender to ramp to the configured cap. Without it a libwebrtc sender stays
-// pinned at its starvation floor.
+// REMB asks the sender to ramp to the cap. Without it a libwebrtc sender stays pinned at
+// its starvation floor. The cap is the configured maximum, lowered while packets are
+// being lost (`bitrate::BitrateController`).
 const REMB_INTERVAL_MS: u64 = 1000;
 const REPORT_INTERVAL_MS: u64 = 1000;
 const BITRATE_WINDOW_MS: u64 = 1000;
 const HEALTH_LOG_INTERVAL_MS: u64 = 5000;
+/// An Opus frame before the first packet is decoded: 20 ms at 48 kHz.
+const DEFAULT_AUDIO_FRAME_SAMPLES: usize = 960;
+/// Fewest video packets (received plus missing) in a REMB interval for its loss to count.
+const MIN_LOSS_SAMPLE_PACKETS: u32 = 50;
+/// Most lost audio frames filled in for one gap (60 ms at 20 ms frames).
+const MAX_CONCEALED_AUDIO_FRAMES: u32 = 3;
 /// During recovery each P-frame asks for an IDR. Rate-limit requests so they cannot
 /// provoke a stream of expensive keyframes and more packet loss.
 const KEYFRAME_REQUEST_INTERVAL_MS: u64 = 250;
@@ -134,13 +142,17 @@ pub struct NativeMediaPipeline {
     video_jitter: VideoJitterBuffer,
     audio_jitter: AudioJitterBuffer,
     audio_decoder: OpusDecoder,
+    /// Samples per channel of the last decoded Opus frame: the length of a lost one.
+    audio_frame_samples: usize,
     pcm: Vec<i16>,
 
     video_stats: VideoStats,
     stats: StreamingStatsSnapshot,
     decode_stats: DecodeStats,
 
-    max_bitrate_bps: u32,
+    bitrate: BitrateController,
+    /// Jitter-buffer counters at the last REMB, for the interval's loss.
+    remb_prior: VideoStats,
     want_keyframe: bool,
     /// Set after the decode thread dropped or rejected an access unit: discard every
     /// picture until the next IDR, like `VideoJitterBuffer::waiting_keyframe`. Parameter
@@ -183,11 +195,13 @@ impl NativeMediaPipeline {
             video_jitter: VideoJitterBuffer::new(),
             audio_jitter: AudioJitterBuffer::new(),
             audio_decoder: OpusDecoder::new(48_000, 2),
+            audio_frame_samples: DEFAULT_AUDIO_FRAME_SAMPLES,
             pcm: Vec::new(),
             video_stats: VideoStats::default(),
             stats: StreamingStatsSnapshot::default(),
             decode_stats: DecodeStats::default(),
-            max_bitrate_bps: 20_000_000,
+            bitrate: BitrateController::new(20_000_000),
+            remb_prior: VideoStats::default(),
             want_keyframe: false,
             gate_until_idr: false,
             last_control_recovery_ms: None,
@@ -217,7 +231,8 @@ impl NativeMediaPipeline {
 
     /// `configure`: only the REMB ceiling matters here.
     pub fn configure(&mut self, config: &StreamingConfig) {
-        self.max_bitrate_bps = config.max_bitrate_kbps.max(1).saturating_mul(1000);
+        self.bitrate
+            .set_max(config.max_bitrate_kbps.max(1).saturating_mul(1000));
     }
 
     /// `reset`: new peer connection, everything starts over.
@@ -241,6 +256,8 @@ impl NativeMediaPipeline {
         self.video_width = 0;
         self.video_height = 0;
         self.last_remb_ms = None;
+        self.bitrate.reset();
+        self.remb_prior = VideoStats::default();
         self.last_report_ms = None;
         self.bitrate_window_start_ms = None;
         self.bitrate_window_bytes = 0;
@@ -375,9 +392,15 @@ impl NativeMediaPipeline {
             return;
         }
         self.pcm.clear();
-        while let Some(payload) = self.audio_jitter.pop() {
-            if !payload.is_empty() {
-                self.audio_decoder.decode(&payload, &mut self.pcm);
+        while let Some(popped) = self.audio_jitter.pop() {
+            match popped {
+                Popped::Packet(payload) => {
+                    let decoded = self.audio_decoder.decode(&payload, &mut self.pcm);
+                    if decoded > 0 {
+                        self.audio_frame_samples = decoded;
+                    }
+                }
+                Popped::Lost(count) => self.conceal_audio(count),
             }
         }
         if !self.pcm.is_empty() {
@@ -386,6 +409,25 @@ impl NativeMediaPipeline {
                 self.audio_decoder.sample_rate(),
                 u32::from(self.audio_decoder.channels()),
             );
+        }
+    }
+
+    /// Fills a gap of `count` lost packets so the decoder sees no discontinuity: the last
+    /// lost frame from the in-band FEC copy in the packet after the gap, the ones before
+    /// it by concealment. A long outage is not filled in full: by then the device has
+    /// played silence, and synthesising all of it would only delay the audio.
+    fn conceal_audio(&mut self, count: u32) {
+        let frame = self.audio_frame_samples;
+        let frames = count.min(MAX_CONCEALED_AUDIO_FRAMES);
+        for _ in 1..frames {
+            self.audio_decoder.conceal(frame, &mut self.pcm);
+        }
+        let recovered = match self.audio_jitter.peek() {
+            Some(next) => self.audio_decoder.decode_fec(next, frame, &mut self.pcm),
+            None => 0,
+        };
+        if recovered == 0 {
+            self.audio_decoder.conceal(frame, &mut self.pcm);
         }
     }
 
@@ -444,6 +486,7 @@ impl NativeMediaPipeline {
                     target: LOG,
                     fps = format_args!("{:.1}", self.stats.frames_per_second),
                     bitrate_kbps = self.stats.bitrate_kbps,
+                    bitrate_limit_kbps = self.stats.bitrate_limit_kbps,
                     max_frame_gap_ms = self.max_frame_gap_ms,
                     max_decode_ms = format_args!("{:.1}", self.max_decode_ms),
                     dropped = self.video_stats.dropped,
@@ -474,8 +517,40 @@ impl NativeMediaPipeline {
             && due(self.last_remb_ms, now_ms, REMB_INTERVAL_MS)
         {
             self.last_remb_ms = Some(now_ms);
-            // Ask for the configured ceiling; the sender's own estimator decides.
-            sender.remb(self.max_bitrate_bps);
+            let now = self.video_stats;
+            let prior = std::mem::replace(&mut self.remb_prior, now);
+            let lost = now.lost_packets.saturating_sub(prior.lost_packets);
+            let received = now.packets.saturating_sub(prior.packets);
+            let interval = Interval {
+                loss: lost as f32 / (lost + received).max(1) as f32,
+                frames_dropped: now.dropped.saturating_sub(prior.dropped),
+                received_bps: (self.stats.bitrate_kbps.max(0) as u32).saturating_mul(1000),
+            };
+            let before = self.bitrate.target_bps();
+            // A handful of packets says nothing about the link (stream start, a stall):
+            // keep the limit as it is.
+            let target = if lost + received >= MIN_LOSS_SAMPLE_PACKETS {
+                self.bitrate.update(interval)
+            } else {
+                before
+            };
+            if target < before {
+                tracing::info!(
+                    target: LOG,
+                    loss_percent = format_args!("{:.1}", interval.loss * 100.0),
+                    frames_dropped = interval.frames_dropped,
+                    limit_kbps = target / 1000,
+                    "packet loss: bitrate limit lowered"
+                );
+            } else if before < target && !self.bitrate.is_limiting() {
+                tracing::info!(target: LOG, limit_kbps = target / 1000, "bitrate limit lifted");
+            }
+            self.stats.bitrate_limit_kbps = if self.bitrate.is_limiting() {
+                (target / 1000) as i32
+            } else {
+                0
+            };
+            sender.remb(target);
         }
 
         if let Some(sender) = self.sender.as_ref()
@@ -1157,6 +1232,47 @@ mod tests {
     }
 
     #[test]
+    fn packet_loss_lowers_the_remb_and_a_clean_link_restores_it() {
+        let mut h = harness(true);
+        h.pipeline.tick(0);
+        // A second in which every other packet goes missing (padding packets: only the
+        // sequence numbers matter here).
+        for i in 0..100u16 {
+            h.pipeline
+                .push_video_rtp(&rtp_packet(i * 2, 0, false, &[]), u64::from(i) * 10);
+        }
+        h.pipeline.tick(1000);
+        let lowered = h.sender.rembs.lock()[0];
+        assert!(
+            lowered < 20_000_000,
+            "50 % loss lowers the ceiling: {lowered}"
+        );
+        assert_eq!(
+            h.pipeline.stats().bitrate_limit_kbps,
+            (lowered / 1000) as i32,
+            "the overlay shows the limit"
+        );
+
+        // Clean seconds raise it again, step by step, until the maximum is back.
+        let mut seq = 200u16;
+        let mut now = 1000u64;
+        let mut last = lowered;
+        while last < 20_000_000 {
+            for _ in 0..100 {
+                h.pipeline
+                    .push_video_rtp(&rtp_packet(seq, 0, false, &[]), now);
+                seq += 1;
+            }
+            now += 1000;
+            h.pipeline.tick(now);
+            let next = *h.sender.rembs.lock().last().unwrap();
+            assert!(next > last, "climbing: {last} -> {next}");
+            last = next;
+        }
+        assert_eq!(h.pipeline.stats().bitrate_limit_kbps, 0, "limit lifted");
+    }
+
+    #[test]
     fn health_log_runs_once_per_five_seconds() {
         // No assertion on the log itself; this exercises the 5 s branch for coverage and
         // checks the max counters are reset by it.
@@ -1221,21 +1337,37 @@ mod tests {
     }
 
     #[test]
-    fn audio_jitter_releases_in_sequence_order() {
+    fn a_lost_audio_packet_is_concealed_without_waiting() {
         let mut h = harness(false);
         let opus = [0x08u8, 0x00];
         h.pipeline
             .push_audio_rtp(&rtp_packet(10, 0, false, &opus), 0);
-        // seq 12 arrives before 11: held, not decoded yet.
+        // 11 is lost. 12 arriving fills 11's 20 ms and plays straight away, instead of
+        // the audio stalling until more packets pile up.
         h.pipeline
             .push_audio_rtp(&rtp_packet(12, 0, false, &opus), 0);
-        assert_eq!(h.pcm.lock().len(), 1);
+        let pcm = h.pcm.lock().clone();
+        assert_eq!(pcm.len(), 2, "no wait for the missing packet");
+        assert_eq!(pcm[1].0, 2 * 960 * 2, "the concealed frame and packet 12");
+        assert_eq!(h.pipeline.audio_packets_lost(), 1);
+        // 11 turning up afterwards is too late; nothing is played twice.
         h.pipeline
             .push_audio_rtp(&rtp_packet(11, 0, false, &opus), 0);
+        assert_eq!(h.pcm.lock().len(), 2);
+    }
+
+    #[test]
+    fn a_long_audio_outage_is_only_partly_filled() {
+        let mut h = harness(false);
+        let opus = [0x08u8, 0x00];
+        h.pipeline
+            .push_audio_rtp(&rtp_packet(10, 0, false, &opus), 0);
+        // Ten packets (200 ms) lost: three frames are synthesised, not ten.
+        h.pipeline
+            .push_audio_rtp(&rtp_packet(21, 0, false, &opus), 0);
         let pcm = h.pcm.lock().clone();
-        assert_eq!(pcm.len(), 2);
-        assert_eq!(pcm[1].0, 2 * 960 * 2, "11 and 12 decoded in one drain");
-        assert_eq!(h.pipeline.audio_packets_lost(), 0);
+        assert_eq!(pcm[1].0, (3 + 1) * 960 * 2);
+        assert_eq!(h.pipeline.audio_packets_lost(), 10);
     }
 
     #[test]

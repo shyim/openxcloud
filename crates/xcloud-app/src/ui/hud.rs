@@ -284,7 +284,17 @@ fn detail_rows(s: &StreamSnapshot) -> Vec<(&'static str, String)> {
     }
     let d = &s.decode_stats;
     let v = &s.video_stats;
+    let limit = s.stats.bitrate_limit_kbps;
     vec![
+        (
+            "Bitrate limit (packet loss)",
+            if limit > 0 {
+                format!("{:.1} Mbps", f64::from(limit) / 1000.0)
+            } else {
+                "None".into()
+            },
+        ),
+        ("Video packets lost", v.lost_packets.to_string()),
         ("Incomplete video frames dropped", v.dropped.to_string()),
         ("Decode queue drops", d.dropped_full.to_string()),
         ("Frames skipped during recovery", d.gated.to_string()),

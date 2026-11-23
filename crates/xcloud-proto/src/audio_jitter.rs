@@ -1,16 +1,31 @@
 //! Port of qt/src/streaming/AudioJitterBuffer.{h,cpp}
 //!
-//! Sequence-ordered reorder buffer for Opus RTP packets. Ported from green-nx
+//! Sequence-ordered buffer for Opus RTP packets. Ported from green-nx
 //! (src/switch/stream/audio_jitter.{hpp,cpp}), which mirrors green-vita's
-//! SampleBuilder. Opus is stateful, so decoding packets out of order is
-//! audible; this releases packets to the decoder strictly in sequence order,
-//! holding briefly for a late packet and skipping a genuinely lost one once
-//! too many pile up behind it.
+//! SampleBuilder. Opus is stateful, so packets go to the decoder strictly in
+//! sequence order, and a gap is reported as [`Popped::Lost`] so the caller can
+//! conceal it instead of feeding the decoder a discontinuity.
+//!
+//! Unlike the original, a missing packet is not waited for. Audio is not
+//! retransmitted, so the only thing waiting can win is a reordered packet, and
+//! it costs silence for as long as the wait lasts and a burst afterwards (the
+//! original held up to 32 packets, over half a second, behind every lost one).
 
-/// Give up waiting for a missing packet once this many later ones have piled up
-/// behind it. At one 20 ms Opus frame per packet that is far more slack than
-/// any normal reordering needs.
-const MAX_LATE: usize = 32;
+/// How many later packets must be waiting before a missing one counts as lost.
+/// One: the moment its successor arrives. A packet that does arrive after its
+/// successor is dropped as late, and concealed like a lost one.
+const REORDER_WINDOW: usize = 1;
+
+/// What [`AudioJitterBuffer::pop`] hands out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Popped {
+    /// The next Opus payload in sequence.
+    Packet(Vec<u8>),
+    /// This many packets before the next one never arrived. The next `pop`
+    /// returns the packet after the gap; [`AudioJitterBuffer::peek`] shows it,
+    /// for decoding its in-band FEC copy of the last lost frame.
+    Lost(u32),
+}
 
 struct Entry {
     seq: u16,
@@ -73,34 +88,37 @@ impl AudioJitterBuffer {
         });
     }
 
-    /// Moves the next in-sequence packet out; `None` while waiting for it.
-    pub fn pop(&mut self) -> Option<Vec<u8>> {
+    /// The next in-sequence packet, or the size of the gap before it; `None`
+    /// when nothing is buffered.
+    pub fn pop(&mut self) -> Option<Popped> {
         if self.pending.is_empty() {
             return None;
         }
-
-        let mut index = self.find_seq(self.next_seq);
-        if index.is_none() {
-            // The next packet has not arrived. Wait for it unless too many later
-            // packets piled up, then treat the gap as lost and skip ahead.
-            if self.pending.len() < MAX_LATE {
-                return None;
-            }
-            let mut oldest = self.pending[0].seq;
-            for entry in &self.pending {
-                if seq_before(entry.seq, oldest) {
-                    oldest = entry.seq;
-                }
-            }
-            self.lost += u32::from(oldest.wrapping_sub(self.next_seq));
-            self.next_seq = oldest;
-            index = self.find_seq(self.next_seq);
+        if let Some(index) = self.find_seq(self.next_seq) {
+            let entry = self.pending.remove(index);
+            self.next_seq = self.next_seq.wrapping_add(1);
+            return Some(Popped::Packet(entry.data));
         }
+        // The next packet has not arrived but later ones have.
+        if self.pending.len() < REORDER_WINDOW {
+            return None;
+        }
+        let mut oldest = self.pending[0].seq;
+        for entry in &self.pending {
+            if seq_before(entry.seq, oldest) {
+                oldest = entry.seq;
+            }
+        }
+        let gap = u32::from(oldest.wrapping_sub(self.next_seq));
+        self.lost += gap;
+        self.next_seq = oldest;
+        Some(Popped::Lost(gap))
+    }
 
-        let index = index?;
-        let entry = self.pending.remove(index);
-        self.next_seq = self.next_seq.wrapping_add(1);
-        Some(entry.data)
+    /// The payload the next [`Self::pop`] returns as a packet, if it is buffered.
+    pub fn peek(&self) -> Option<&[u8]> {
+        self.find_seq(self.next_seq)
+            .map(|index| self.pending[index].data.as_slice())
     }
 
     fn find_seq(&self, want: u16) -> Option<usize> {
@@ -116,28 +134,75 @@ mod tests {
         vec![value as u8, (value + 1) as u8]
     }
 
+    /// The first byte of the next packet; panics on a gap or an empty buffer.
+    fn packet(buffer: &mut AudioJitterBuffer) -> u8 {
+        match buffer.pop() {
+            Some(Popped::Packet(data)) => data[0],
+            other => panic!("expected a packet, got {other:?}"),
+        }
+    }
+
     #[test]
     fn releases_in_sequence_order() {
         let mut buffer = AudioJitterBuffer::new();
         buffer.push(1, &payload(1));
-        let out = buffer.pop().unwrap();
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0], 1);
+        buffer.push(2, &payload(2));
+        assert_eq!(packet(&mut buffer), 1);
+        assert_eq!(packet(&mut buffer), 2);
         assert!(buffer.pop().is_none()); // nothing more pending
     }
 
     #[test]
-    fn reorders_out_of_order_arrival() {
+    fn a_gap_is_reported_as_soon_as_a_later_packet_arrives() {
         let mut buffer = AudioJitterBuffer::new();
-        // The first packet establishes the stream start; later packets may arrive
-        // out of order and are released in sequence order.
         buffer.push(1, &payload(1));
+        assert_eq!(packet(&mut buffer), 1);
+        // 2 never arrives; 3 shows the gap immediately.
+        buffer.push(3, &payload(3));
+        assert_eq!(buffer.peek(), None, "the expected packet is missing");
+        assert_eq!(buffer.pop(), Some(Popped::Lost(1)));
+        assert_eq!(buffer.peek(), Some(&payload(3)[..]), "for the FEC decode");
+        assert_eq!(packet(&mut buffer), 3);
+        assert!(buffer.pop().is_none());
+        assert_eq!(buffer.lost(), 1);
+    }
+
+    #[test]
+    fn a_burst_loss_is_one_gap() {
+        let mut buffer = AudioJitterBuffer::new();
+        buffer.push(10, &payload(10));
+        assert_eq!(packet(&mut buffer), 10);
+        buffer.push(15, &payload(15));
+        assert_eq!(buffer.pop(), Some(Popped::Lost(4)));
+        assert_eq!(packet(&mut buffer), 15);
+        assert_eq!(buffer.lost(), 4);
+    }
+
+    #[test]
+    fn a_packet_arriving_after_its_successor_is_late() {
+        let mut buffer = AudioJitterBuffer::new();
+        buffer.push(1, &payload(1));
+        assert_eq!(packet(&mut buffer), 1);
+        buffer.push(3, &payload(3));
+        assert_eq!(buffer.pop(), Some(Popped::Lost(1)));
+        assert_eq!(packet(&mut buffer), 3);
+        // 2 turns up now: its slot was concealed already.
+        buffer.push(2, &payload(2));
+        assert!(buffer.pop().is_none());
+        assert_eq!(buffer.pending_len(), 0);
+    }
+
+    #[test]
+    fn packets_pushed_together_are_ordered() {
+        let mut buffer = AudioJitterBuffer::new();
+        // Both are buffered before the first pop, so their order is restored.
+        buffer.push(1, &payload(1));
+        assert_eq!(packet(&mut buffer), 1);
         buffer.push(3, &payload(3));
         buffer.push(2, &payload(2));
-        assert_eq!(buffer.pop().unwrap()[0], 1);
-        assert_eq!(buffer.pop().unwrap()[0], 2);
-        assert_eq!(buffer.pop().unwrap()[0], 3);
-        assert!(buffer.pop().is_none());
+        assert_eq!(packet(&mut buffer), 2);
+        assert_eq!(packet(&mut buffer), 3);
+        assert_eq!(buffer.lost(), 0);
     }
 
     #[test]
@@ -146,8 +211,8 @@ mod tests {
         buffer.push(1, &payload(1));
         buffer.push(1, &payload(1));
         buffer.push(2, &payload(2));
-        assert_eq!(buffer.pop().unwrap()[0], 1);
-        assert_eq!(buffer.pop().unwrap()[0], 2);
+        assert_eq!(packet(&mut buffer), 1);
+        assert_eq!(packet(&mut buffer), 2);
         assert!(buffer.pop().is_none());
     }
 
@@ -159,24 +224,7 @@ mod tests {
         // seq 1 arrived again after delivery: too late.
         buffer.push(1, &payload(1));
         buffer.push(2, &payload(2));
-        assert_eq!(buffer.pop().unwrap()[0], 2);
-    }
-
-    #[test]
-    fn skips_lost_after_backlog() {
-        let mut buffer = AudioJitterBuffer::new();
-        buffer.push(1, &payload(1));
-        assert!(buffer.pop().is_some()); // next is now 2
-
-        // 2 never arrives; pile up 33 later packets.
-        for seq in 3..3 + 33 {
-            buffer.push(seq as u16, &payload(seq & 0xff));
-        }
-
-        let out = buffer.pop().unwrap();
-        // We skipped the lost seq 2 and released the oldest held packet.
-        assert_eq!(out[0], 3);
-        assert_eq!(buffer.lost(), 1);
+        assert_eq!(packet(&mut buffer), 2);
     }
 
     #[test]
@@ -187,7 +235,7 @@ mod tests {
         buffer.reset();
         // A new stream may restart at any sequence number.
         buffer.push(5, &payload(5));
-        assert_eq!(buffer.pop().unwrap()[0], 5);
+        assert_eq!(packet(&mut buffer), 5);
         assert_eq!(buffer.lost(), 0);
     }
 
@@ -196,8 +244,8 @@ mod tests {
         let mut buffer = AudioJitterBuffer::new();
         buffer.push(0xffff, &payload(1));
         buffer.push(0, &payload(2));
-        assert_eq!(buffer.pop().unwrap()[0], 1);
-        assert_eq!(buffer.pop().unwrap()[0], 2);
+        assert_eq!(packet(&mut buffer), 1);
+        assert_eq!(packet(&mut buffer), 2);
         // 0xfffe is now "before" the next expected (1): dropped as late.
         buffer.push(0xfffe, &payload(9));
         assert!(buffer.pop().is_none());
