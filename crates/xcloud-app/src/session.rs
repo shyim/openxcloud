@@ -311,6 +311,8 @@ impl SessionController {
             false
         });
         if !has_session {
+            // No login: nothing kept for an earlier account may survive either.
+            self.emit(SessionEvent::SignedOut);
             self.set_state(AuthState::Unauthenticated);
             return;
         }
@@ -368,6 +370,9 @@ impl SessionController {
                 if let Err(clear_error) = self.auth.clear_session() {
                     tracing::warn!(target: LOG, "clearing the stale session failed: {clear_error}");
                 }
+                // The same as a sign-out for everything kept per account.
+                *self.tokens.lock() = StreamTokens::default();
+                self.emit(SessionEvent::SignedOut);
                 self.set_state(AuthState::Unauthenticated);
             }
         }
@@ -732,6 +737,8 @@ mod tests {
         assert_eq!(snapshot.last_error, "");
         assert_eq!(h.transport.request_count(), 0);
         expect_tokens_restored(&h, &StreamTokens::default());
+        // Ending up without a login clears what is kept per account, like a sign-out.
+        assert_eq!(h.events.try_recv(), Ok(SessionEvent::SignedOut));
         assert!(h.events.try_recv().is_err());
         assert!(h.repaints.load(Ordering::SeqCst) >= 1);
     }
@@ -744,6 +751,8 @@ mod tests {
         h.session.send(SessionCommand::RestoreSession);
         wait_until(&h.session, |s| s.state == AuthState::Unauthenticated).await;
         expect_tokens_restored(&h, &stored_tokens());
+        // Ending up without a login clears what is kept per account, like a sign-out.
+        assert_eq!(h.events.try_recv(), Ok(SessionEvent::SignedOut));
         assert!(h.events.try_recv().is_err());
         assert_eq!(h.transport.request_count(), 0);
     }
@@ -935,6 +944,8 @@ mod tests {
         assert_eq!(h.store.load_refresh_token().unwrap(), "");
         assert_eq!(h.store.load_msa_token().unwrap(), "");
         expect_tokens_restored(&h, &StreamTokens::default());
+        // Ending up without a login clears what is kept per account, like a sign-out.
+        assert_eq!(h.events.try_recv(), Ok(SessionEvent::SignedOut));
         assert!(h.events.try_recv().is_err());
     }
 
@@ -1200,6 +1211,8 @@ mod tests {
         wait_for_tokens_restored(&h, &StreamTokens::default()).await;
         assert_eq!(h.session.read().state, AuthState::Unauthenticated);
         assert_eq!(h.transport.request_count(), request_count);
+        // Ending up without a login clears what is kept per account, like a sign-out.
+        assert_eq!(h.events.try_recv(), Ok(SessionEvent::SignedOut));
         assert!(h.events.try_recv().is_err());
     }
 
@@ -1214,6 +1227,8 @@ mod tests {
 
         wait_until(&h.session, |s| s.state == AuthState::Unauthenticated).await;
         expect_tokens_restored(&h, &stored_tokens());
+        // Ending up without a login clears what is kept per account, like a sign-out.
+        assert_eq!(h.events.try_recv(), Ok(SessionEvent::SignedOut));
         assert!(h.events.try_recv().is_err());
         assert_eq!(h.transport.request_count(), 0);
 
@@ -1227,6 +1242,11 @@ mod tests {
         h.store.save_stream_tokens(&replaced).unwrap();
         h.session.send(SessionCommand::RestoreSession);
         wait_for_tokens_restored(&h, &stored_tokens()).await;
+        let events = h.events.clone();
+        let next = tokio::task::spawn_blocking(move || events.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(next, Ok(SessionEvent::SignedOut));
         assert!(h.events.try_recv().is_err());
     }
 

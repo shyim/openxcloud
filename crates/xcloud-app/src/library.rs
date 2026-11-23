@@ -807,15 +807,30 @@ impl LibraryController {
         });
     }
 
-    /// Forgets the title list kept for the next launch (the account signed out, so the
-    /// next one must not briefly see this one's games).
+    /// The account is gone (sign-out, or a stored login the service refused): forgets
+    /// its games, in memory and on disk, so the next account never sees them. Any load
+    /// still running is superseded and can neither publish nor write the list back.
     pub fn forget_account(&self) {
+        let mut inner = self.shared.inner.lock();
+        inner.load_generation += 1;
+        inner.raw_items.clear();
+        inner.cards.clear();
+        inner.mru_title_ids.clear();
+        inner.mru_order.clear();
+        inner.is_loading = false;
+        inner.did_load = false;
+        inner.status_text.clear();
+        inner.last_error.clear();
+        inner.authentication_required = false;
+        inner.rebuild_filtered(true);
+        // Removed while holding the lock the writer takes (see `load_library`).
         if let Some(path) = self.catalog_cache_dir.as_deref().map(titles_cache_path)
             && let Err(error) = std::fs::remove_file(&path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(target: LOG, "cannot remove the title cache: {error}");
         }
+        self.shared.publish(&inner);
     }
 
     /// `setQuery`: filters the grid immediately (debounce is the UI's job).
@@ -1026,7 +1041,15 @@ async fn load_library(
         };
         if let Some(path) = titles_path {
             let file = TitlesFile::of(&titles, mru);
+            let shared = Arc::clone(&shared);
             tokio::task::spawn_blocking(move || {
+                // Written under the state lock and only for the load that is still
+                // current: `forget_account` takes the same lock and supersedes every
+                // load, so a list can never be written back after a sign-out.
+                let inner = shared.inner.lock();
+                if inner.load_generation != generation {
+                    return;
+                }
                 if let Err(error) = save_titles_file(&path, &file) {
                     tracing::warn!(target: LOG, "cannot save the title cache: {error}");
                 }
@@ -1566,10 +1589,29 @@ mod tests {
         wait_for(8000, || !h.controller.is_loading()).await;
         assert!(h.controller.snapshot().authentication_required);
 
-        // Signing out drops the saved list, so the next account starts empty.
+        // Signing out drops the saved list and the games in memory, so the next account
+        // starts empty.
         h.controller.forget_account();
         assert!(!file.exists());
+        assert_eq!(h.game_count(), 0);
+        assert!(h.controller.snapshot().is_empty());
         h.controller.forget_account();
+
+        // A load still under way when the account goes must not bring the list back.
+        let h = Harness::new().with_cache_dir(&dir);
+        h.transport.enqueue_json_delayed(
+            "/v2/titles",
+            r#"{"results":[{"titleId":"T1","details":{"productId":"P1"}}]}"#,
+            200,
+        );
+        h.transport
+            .enqueue_json("/v2/titles/mru", r#"{"results":[]}"#, 200);
+        h.controller.refresh(true);
+        h.controller.forget_account();
+        wait_for(8000, || h.transport.pending_count() == 0).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!file.exists(), "the superseded load wrote nothing");
+        assert_eq!(h.game_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
