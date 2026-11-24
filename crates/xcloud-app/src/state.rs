@@ -198,6 +198,8 @@ pub enum LibraryCommand {
     SetLocale(String),
     /// Hide titles the account is not entitled to; reloads a loaded library.
     SetLicensedOnly(bool),
+    /// The account signed out: drop what is kept on disk for its next launch.
+    ForgetAccount,
 }
 
 pub type LibraryHandle = Handle<LibrarySnapshot, LibraryCommand>;

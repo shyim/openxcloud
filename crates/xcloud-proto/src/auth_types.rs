@@ -121,12 +121,22 @@ pub struct StreamTokens {
     pub web_token_uhs: String,
     #[serde(rename = "xcloudRegions")]
     pub xcloud_regions: Vec<LoginRegion>,
+    /// When the stream tokens stop being accepted, as Unix seconds; 0 when the service
+    /// did not say (bundles stored before this field existed read as 0 too).
+    #[serde(rename = "expiresAt")]
+    pub expires_at: i64,
 }
 
 impl StreamTokens {
     /// At least one streaming token is present.
     pub fn is_valid(&self) -> bool {
         !self.xhome_token.is_empty() || !self.xcloud_token.is_empty()
+    }
+
+    /// The tokens are present and known to stay valid for `margin_secs` past `now`
+    /// (Unix seconds). False when the expiry is unknown.
+    pub fn is_fresh(&self, now: i64, margin_secs: i64) -> bool {
+        self.is_valid() && self.expires_at > now.saturating_add(margin_secs)
     }
 
     pub fn to_json(&self) -> Value {
@@ -149,6 +159,7 @@ impl StreamTokens {
                 .iter()
                 .map(LoginRegion::from_json)
                 .collect(),
+            expires_at: object.get("expiresAt").and_then(Value::as_i64).unwrap_or(0),
         }
     }
 }
@@ -261,8 +272,10 @@ mod tests {
             web_token: "WEB".to_owned(),
             web_token_uhs: "UHS".to_owned(),
             xcloud_regions: vec![region("eastus", true), region("westeurope", false)],
+            expires_at: 1_700_000_000,
         };
         let json = tokens.to_json();
+        assert_eq!(json["expiresAt"], 1_700_000_000_i64);
         assert_eq!(json["webTokenUHS"], "UHS");
         assert_eq!(json["xcloudF2PToken"], "F2P");
         assert_eq!(
@@ -278,6 +291,16 @@ mod tests {
         );
         assert!(parsed.is_valid());
         assert!(!StreamTokens::default().is_valid());
+        // Fresh only while the expiry is known and further away than the margin.
+        assert!(parsed.is_fresh(1_699_999_000, 300));
+        assert!(!parsed.is_fresh(1_699_999_800, 300), "inside the margin");
+        assert!(!parsed.is_fresh(1_700_000_001, 0), "expired");
+        let unknown = StreamTokens {
+            expires_at: 0,
+            ..parsed.clone()
+        };
+        assert!(!unknown.is_fresh(0, 0), "an unknown expiry is never fresh");
+        assert!(!StreamTokens::default().is_fresh(0, 0));
         assert!(StreamTokens::from_json(&serde_json::json!({})) == StreamTokens::default());
     }
 

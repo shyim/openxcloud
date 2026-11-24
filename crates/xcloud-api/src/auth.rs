@@ -81,6 +81,8 @@ struct GssvLogin {
     gs_token: String,
     base_host: String,
     regions: Vec<LoginRegion>,
+    /// `durationInSeconds`: how long the token is accepted; 0 when not reported.
+    duration_secs: i64,
 }
 
 /// Owns Microsoft device-code sign-in, Xbox Live token exchange and stream-token
@@ -393,24 +395,27 @@ impl MicrosoftAuthService {
     }
 
     /// Step 4: GSSV XSTS token -> gsTokens. xhome is required; xgpuweb and xgpuwebf2p are
-    /// best effort and run concurrently. The bundle is persisted for the next launch.
+    /// best effort. The three logins run concurrently. The bundle is persisted for the
+    /// next launch, with the time its shortest-lived token expires.
     pub async fn get_stream_token_bundle(&self, xsts_token: &str) -> Result<StreamTokens> {
-        let home = self
-            .gssv_login(xsts_token, "xhome")
-            .await
-            .map_err(|e| with_context("Token exchange failed", e))?;
+        let issued = Utc::now().timestamp();
+        let (home, cloud, f2p) = tokio::join!(
+            self.gssv_login(xsts_token, "xhome"),
+            self.gssv_login(xsts_token, "xgpuweb"),
+            self.gssv_login(xsts_token, "xgpuwebf2p"),
+        );
+        let home = home.map_err(|e| with_context("Token exchange failed", e))?;
+        // Unknown (0) if any token in the bundle did not report a lifetime.
+        let mut lifetime = home.duration_secs;
         let mut tokens = StreamTokens {
             xhome_token: home.gs_token,
             xhome_host: home.base_host,
             ..StreamTokens::default()
         };
 
-        let (cloud, f2p) = tokio::join!(
-            self.gssv_login(xsts_token, "xgpuweb"),
-            self.gssv_login(xsts_token, "xgpuwebf2p"),
-        );
         match cloud {
             Ok(cloud) => {
+                lifetime = lifetime.min(cloud.duration_secs);
                 tokens.xcloud_token = cloud.gs_token;
                 tokens.xcloud_host = cloud.base_host;
                 tokens.xcloud_regions = cloud.regions;
@@ -421,6 +426,7 @@ impl MicrosoftAuthService {
         }
         match f2p {
             Ok(f2p) => {
+                lifetime = lifetime.min(f2p.duration_secs);
                 tokens.xcloud_f2p_token = f2p.gs_token;
                 tokens.xcloud_f2p_host = f2p.base_host;
                 if tokens.xcloud_regions.is_empty() {
@@ -432,6 +438,9 @@ impl MicrosoftAuthService {
             }
         }
 
+        if lifetime > 0 {
+            tokens.expires_at = issued + lifetime;
+        }
         self.store.save_stream_tokens(&tokens)?;
         Ok(tokens)
     }
@@ -440,14 +449,19 @@ impl MicrosoftAuthService {
     /// token is best effort; its failure never blocks stream token acquisition.
     pub async fn exchange_for_stream_tokens(&self, msa_access_token: &str) -> Result<StreamTokens> {
         let user = self.get_xbox_user_token(msa_access_token).await?;
-        let web = match self.get_web_token(&user.token).await {
+        // Both only need the user token, so they run concurrently.
+        let (web, xsts) = tokio::join!(
+            self.get_web_token(&user.token),
+            self.get_xsts_token(&user.token, GSSV_RELYING_PARTY),
+        );
+        let web = match web {
             Ok(web) => Some(web),
             Err(error) => {
                 tracing::warn!(target: LOG_TARGET, error = %error, "web token unavailable");
                 None
             }
         };
-        let xsts = self.get_xsts_token(&user.token, GSSV_RELYING_PARTY).await?;
+        let xsts = xsts?;
         let mut tokens = self.get_stream_token_bundle(&xsts.token).await?;
         if let Some(web) = web {
             tokens.web_token = web.token;
@@ -546,6 +560,11 @@ impl MicrosoftAuthService {
         let object = parse_json_object(&response.body);
         let gs_token = json_string(&object, "gsToken");
         let regions = parse_regions(&object);
+        let duration_secs = object
+            .get("durationInSeconds")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
 
         let mut base_host = format!("https://{host}");
         if !regions.is_empty() {
@@ -564,12 +583,14 @@ impl MicrosoftAuthService {
             offering,
             host = %base_host,
             regions = regions.len(),
+            duration_secs,
             "GSSV login succeeded"
         );
         Ok(GssvLogin {
             gs_token,
             base_host,
             regions,
+            duration_secs,
         })
     }
 }
@@ -1324,7 +1345,8 @@ mod tests {
             matches!(&err, Error::Http(msg) if msg == "Token exchange failed: Stream token: offline"),
             "{err}"
         );
-        assert_eq!(h.transport.request_count(), 1);
+        // The three offering logins go out together; xhome failing still fails the bundle.
+        assert_eq!(h.transport.request_count(), 3);
         assert!(!h.store.load_stream_tokens().unwrap().is_valid());
 
         h.transport
@@ -1343,6 +1365,45 @@ mod tests {
             err.to_string().contains("Stream token: missing gsToken"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_bundle_expires_with_its_shortest_lived_token() {
+        let h = harness();
+        h.transport.enqueue_json(
+            "xhome.gssv",
+            r#"{"gsToken":"XHOME","durationInSeconds":14400}"#,
+            200,
+        );
+        h.transport.enqueue_json(
+            "xgpuweb.gssv",
+            r#"{"gsToken":"XCLOUD","durationInSeconds":3600}"#,
+            200,
+        );
+        h.transport
+            .enqueue_json("xgpuwebf2p.gssv", r#"{"message":"denied"}"#, 403);
+        let before = Utc::now().timestamp();
+        let tokens = h.service.get_stream_token_bundle("XSTS").await.unwrap();
+        let after = Utc::now().timestamp();
+        assert!(
+            (before + 3600..=after + 3600).contains(&tokens.expires_at),
+            "an hour from now, the shorter of the two: {}",
+            tokens.expires_at
+        );
+        assert_eq!(h.store.load_stream_tokens().unwrap(), tokens, "persisted");
+
+        // A login that does not report a lifetime leaves the expiry unknown.
+        h.transport.enqueue_json(
+            "xhome.gssv",
+            r#"{"gsToken":"XHOME","durationInSeconds":14400}"#,
+            200,
+        );
+        h.transport
+            .enqueue_json("xgpuweb.gssv", r#"{"gsToken":"XCLOUD"}"#, 200);
+        h.transport
+            .enqueue_json("xgpuwebf2p.gssv", r#"{"message":"denied"}"#, 403);
+        let tokens = h.service.get_stream_token_bundle("XSTS").await.unwrap();
+        assert_eq!(tokens.expires_at, 0);
     }
 
     #[tokio::test]
